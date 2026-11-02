@@ -24,7 +24,13 @@ import { trackSessionCreated } from '../../../lib/telemetry.js';
 import { listRepos } from '../../../lib/repos.js';
 import { assertValidEnvName, EnvNameError, getEnvPassthrough } from '../../../lib/sessionEnv.js';
 import { deliverSilenceNotification } from '../lib/silenceMonitor.js';
-import { getSystemHealth, sleepSystem } from '../lib/systemHealth.js';
+import {
+  getSystemHealth,
+  sleepSystem,
+  sleepDisplay,
+  getTunnelTimer,
+  setTunnelTimer,
+} from '../lib/systemHealth.js';
 import { getGitDiff } from '../lib/gitDiff.js';
 
 const execFileAsync = promisify(execFile);
@@ -526,6 +532,34 @@ sessionsRouter.post('/system-sleep', async (_req, res) => {
   try {
     await sleepSystem();
     res.json({ ok: true, message: 'Mac is sleeping' });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+sessionsRouter.post('/system-displaysleep', async (_req, res) => {
+  try {
+    await sleepDisplay();
+    res.json({ ok: true, message: 'Mac display put to sleep (Stealth Mode)' });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+sessionsRouter.get('/tunnel-timer', async (_req, res) => {
+  try {
+    const timer = await getTunnelTimer();
+    res.json({ ok: true, timer });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+sessionsRouter.post('/tunnel-timer', async (req, res) => {
+  try {
+    const minutes = typeof req.body?.minutes === 'number' ? req.body.minutes : 0;
+    const result = await setTunnelTimer(minutes);
+    res.json(result);
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

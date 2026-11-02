@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseBatteryOutput, parseVmStat, formatUptime } from './systemHealth.js';
+import { parseBatteryOutput, parseVmStat, formatUptime, formatTimerSeconds } from './systemHealth.js';
 
 describe('systemHealth', () => {
   describe('parseBatteryOutput', () => {
@@ -68,6 +68,21 @@ Pages occupied by compressor:            406616.`;
 
     it('formats minutes', () => {
       assert.equal(formatUptime(60 * 42), '42m');
+    });
+  });
+
+  describe('formatTimerSeconds', () => {
+    it('formats hours and minutes', () => {
+      assert.equal(formatTimerSeconds(3600 * 2 + 60 * 15), '2h 15m');
+    });
+
+    it('formats minutes and seconds', () => {
+      assert.equal(formatTimerSeconds(60 * 5 + 9), '5m 09s');
+    });
+
+    it('handles zero or negative seconds', () => {
+      assert.equal(formatTimerSeconds(0), '0s');
+      assert.equal(formatTimerSeconds(-10), '0s');
     });
   });
 });

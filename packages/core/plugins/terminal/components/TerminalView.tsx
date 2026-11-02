@@ -119,6 +119,35 @@ const TerminalView = forwardRef<HTMLIFrameElement, Props>(function TerminalView(
     };
   }, [sessionId]);
 
+  // Feature 6: Listen for "Jump to Bottom" request from MobileInputChrome
+  useEffect(() => {
+    const handleScrollToBottom = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (!detail || !detail.sessionId || detail.sessionId === sessionId) {
+        try {
+          const iframe = iframeRef.current;
+          const iframeWin = iframe?.contentWindow as any;
+          const term = iframeWin?.term;
+          if (term) {
+            if (typeof term.scrollToBottom === 'function') {
+              term.scrollToBottom();
+            }
+            window.dispatchEvent(
+              new CustomEvent('omniterm:terminal-scrolled-up', {
+                detail: { sessionId, isScrolledUp: false },
+              }),
+            );
+          }
+        } catch {}
+      }
+    };
+
+    window.addEventListener('omniterm:scroll-to-bottom', handleScrollToBottom);
+    return () => {
+      window.removeEventListener('omniterm:scroll-to-bottom', handleScrollToBottom);
+    };
+  }, [sessionId]);
+
   const reportRendered = useCallback(() => {
     if (renderReportedRef.current || mountedAtRef.current === null) return;
     renderReportedRef.current = true;
@@ -168,6 +197,45 @@ const TerminalView = forwardRef<HTMLIFrameElement, Props>(function TerminalView(
         if (!install()) {
           const iv = setInterval(() => {
             if (install() || ++attempts >= 40) clearInterval(iv);
+          }, 100);
+        }
+      }
+
+      // Feature 6: Terminal scroll tracking for "Jump to Bottom" button
+      if (!(iframeDoc as any).__omniterm_scroll) {
+        const iframeWin = iframe.contentWindow as any;
+        let attempts = 0;
+        const installScroll = () => {
+          const term = iframeWin?.term;
+          if (term && term.buffer) {
+            const checkScroll = () => {
+              try {
+                const buf = term.buffer.active;
+                const isScrolledUp = buf ? buf.viewportY < buf.baseY - 2 : false;
+                window.dispatchEvent(
+                  new CustomEvent('omniterm:terminal-scrolled-up', {
+                    detail: { sessionId, isScrolledUp },
+                  }),
+                );
+              } catch {}
+            };
+            if (typeof term.onScroll === 'function') {
+              term.onScroll(checkScroll);
+            }
+            if (typeof term.onLineFeed === 'function') {
+              term.onLineFeed(checkScroll);
+            }
+            iframeDoc.addEventListener('wheel', () => setTimeout(checkScroll, 60), { passive: true });
+            iframeDoc.addEventListener('touchend', () => setTimeout(checkScroll, 60), { passive: true });
+            checkScroll();
+            (iframeDoc as any).__omniterm_scroll = true;
+            return true;
+          }
+          return false;
+        };
+        if (!installScroll()) {
+          const iv = setInterval(() => {
+            if (installScroll() || ++attempts >= 40) clearInterval(iv);
           }, 100);
         }
       }

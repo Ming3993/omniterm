@@ -51,3 +51,22 @@ function App() {
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
+
+// Register PWA Service Worker for native app installation support
+if (typeof window !== 'undefined') {
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker
+        .register('/sw.js')
+        .then(() => console.log('[omniterm] ServiceWorker registered'))
+        .catch((err) => console.warn('[omniterm] ServiceWorker failed:', err));
+    });
+  }
+
+  // Intercept beforeinstallprompt for Chrome / Samsung Internet
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    (window as any).__omniterm_pwa_prompt = e;
+    window.dispatchEvent(new CustomEvent('omniterm:pwa-installable'));
+  });
+}

@@ -254,6 +254,26 @@ test('GET /system-health returns health metrics', async () => {
   });
 });
 
+test('GET /tunnel-timer and POST /tunnel-timer manage tunnel auto-off lease', async () => {
+  await withServer(async (base) => {
+    const getRes = await fetch(`${base}/tunnel-timer`);
+    assert.equal(getRes.status, 200);
+    const getBody = (await getRes.json()) as { ok: boolean; timer: any };
+    assert.equal(getBody.ok, true);
+    assert.ok(typeof getBody.timer.active === 'boolean');
+
+    // Cancel timer (0 minutes)
+    const postRes = await fetch(`${base}/tunnel-timer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ minutes: 0 }),
+    });
+    assert.equal(postRes.status, 200);
+    const postBody = (await postRes.json()) as { ok: boolean };
+    assert.equal(postBody.ok, true);
+  });
+});
+
 test('GET /git-diff returns diff results for repository', async () => {
   await withServer(async (base) => {
     const res = await fetch(`${base}/git-diff?path=${encodeURIComponent(process.cwd())}`);

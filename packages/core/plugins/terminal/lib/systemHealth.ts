@@ -1,4 +1,5 @@
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 import { promisify } from 'util';
 import { isTunnelActive } from './silenceMonitor.js';
@@ -177,4 +178,122 @@ export async function sleepSystem(): Promise<void> {
     // Fallback to pmset sleepnow
     await execFileAsync('pmset', ['sleepnow']);
   }
+}
+
+/**
+ * Puts Mac displays to sleep immediately without sleeping the CPU/system (Stealth Mode).
+ */
+export async function sleepDisplay(): Promise<void> {
+  try {
+    await execFileAsync('pmset', ['displaysleepnow']);
+  } catch (err) {
+    // Fallback to display dimming via osascript
+    await execFileAsync('osascript', ['-e', 'tell application "System Events" to sleep']);
+  }
+}
+
+const TIMER_FILE = '/tmp/remote_tunnel_timer.pid';
+
+export interface TunnelTimerStatus {
+  active: boolean;
+  remainingSeconds: number;
+  remainingFormatted: string;
+}
+
+export function formatTimerSeconds(seconds: number): string {
+  if (seconds <= 0) return '0s';
+  const totalMins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (totalMins >= 60) {
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    return `${hours}h ${mins}m`;
+  }
+  return `${totalMins}m ${secs < 10 ? '0' : ''}${secs}s`;
+}
+
+/**
+ * Check remaining lease/timer for the reverse tunnel.
+ */
+export async function getTunnelTimer(): Promise<TunnelTimerStatus> {
+  try {
+    if (!fs.existsSync(TIMER_FILE)) {
+      return { active: false, remainingSeconds: 0, remainingFormatted: '' };
+    }
+    const raw = fs.readFileSync(TIMER_FILE, 'utf-8');
+    const info = JSON.parse(raw);
+    const nowSecs = Date.now() / 1000;
+    const remaining = Math.max(0, Math.floor(info.end_time - nowSecs));
+
+    if (remaining <= 0) {
+      // Expired: cleanup
+      try {
+        fs.unlinkSync(TIMER_FILE);
+      } catch {}
+      return { active: false, remainingSeconds: 0, remainingFormatted: '' };
+    }
+
+    return {
+      active: true,
+      remainingSeconds: remaining,
+      remainingFormatted: formatTimerSeconds(remaining),
+    };
+  } catch {
+    return { active: false, remainingSeconds: 0, remainingFormatted: '' };
+  }
+}
+
+/**
+ * Configure auto-lock timer for reverse tunnel.
+ * If minutes <= 0: cancel active timer.
+ */
+export async function setTunnelTimer(minutes: number): Promise<{ ok: boolean; message: string }> {
+  // 1. Cancel previous timer if any
+  try {
+    if (fs.existsSync(TIMER_FILE)) {
+      const raw = fs.readFileSync(TIMER_FILE, 'utf-8');
+      const info = JSON.parse(raw);
+      if (info.pid) {
+        try {
+          process.kill(info.pid, 'SIGKILL');
+        } catch {}
+      }
+      fs.unlinkSync(TIMER_FILE);
+    }
+  } catch {}
+
+  if (minutes <= 0) {
+    return { ok: true, message: 'Đã hủy hẹn giờ tắt tunnel' };
+  }
+
+  const secs = minutes * 60;
+  const endTime = Date.now() / 1000 + secs;
+
+  // 2. Spawn detached sleeper process that runs remote-tunnel force-off when timeout expires
+  const helperScript = `
+    const { execSync } = require('child_process');
+    setTimeout(() => {
+      try {
+        execSync('/opt/homebrew/bin/remote-tunnel force-off', { stdio: 'ignore' });
+      } catch {}
+      process.exit(0);
+    }, ${secs * 1000});
+  `;
+
+  const child = spawn(process.execPath, ['-e', helperScript], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const timerInfo = {
+    pid: child.pid,
+    end_time: endTime,
+  };
+  fs.writeFileSync(TIMER_FILE, JSON.stringify(timerInfo), { mode: 0o644 });
+
+  return {
+    ok: true,
+    message: `Đã hẹn giờ tự động đóng tunnel sau ${minutes} phút (${formatTimerSeconds(secs)})`,
+  };
 }

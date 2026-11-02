@@ -87,6 +87,31 @@ export const keepFocusIf =
     if (active) e.preventDefault();
   };
 
+async function sha256(str: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function bufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
 /**
  * Mobile-friendly AI Terminal Chrome (ChatGPT & Gemini App Experience):
  *  - Floating Navigation Pill (▲ / ▼) on the right for history & menu choices.
@@ -134,6 +159,59 @@ export default function MobileInputChrome({
   const [diffLoading, setDiffLoading] = useState(false);
   const [selectedFileIdx, setSelectedFileIdx] = useState(0);
 
+  // Feature 6: Terminal Scroll Tracking ("Jump to Bottom")
+  const [isScrolledUp, setIsScrolledUp] = useState(false);
+
+  // Feature 4: Tunnel Lease Timer state
+  const [tunnelTimer, setTunnelTimer] = useState<{
+    active: boolean;
+    remainingSeconds: number;
+    formatted?: string;
+  } | null>(null);
+
+  // Feature 2: WebAuthn Biometric & PIN Lock state
+  const [bioEnabled, setBioEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('omniterm.bioLock.enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [isBioLocked, setIsBioLocked] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('omniterm.bioLock.enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [autoLockMinutes, setAutoLockMinutes] = useState<number>(() => {
+    try {
+      const val = localStorage.getItem('omniterm.bioLock.autoLockMinutes');
+      return val ? parseInt(val, 10) : 3;
+    } catch {
+      return 3;
+    }
+  });
+  const [pinInput, setPinInput] = useState('');
+  const [pinError, setPinError] = useState('');
+  const [showPinSetupModal, setShowPinSetupModal] = useState(false);
+  const [setupPinValue, setSetupPinValue] = useState('');
+  const [setupPinError, setSetupPinError] = useState('');
+
+  // Feature 5: PWA Standalone Detection & Installation Prompt
+  const [isStandalone] = useState<boolean>(() => {
+    try {
+      return (
+        window.matchMedia('(display-mode: standalone)').matches ||
+        (window.navigator as any).standalone === true
+      );
+    } catch {
+      return false;
+    }
+  });
+  const [showPwaModal, setShowPwaModal] = useState(false);
+  const [pwaInstallPrompt, setPwaInstallPrompt] = useState<any>(null);
+
   const composeRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -179,15 +257,15 @@ export default function MobileInputChrome({
       setConfirmSleep(false);
       setShowHealthModal(false);
       setNotificationToast({
-        title: '💤 Cho Mac ngủ',
-        message: 'Đã gửi lệnh đưa Mac vào chế độ ngủ...',
+        title: 'Sleep Mode',
+        message: 'Đang gửi lệnh đưa Mac vào chế độ ngủ...',
         timestamp: Date.now(),
         type: 'info',
       });
       await fetch('/api/system-sleep', { method: 'POST' });
     } catch (err) {
       setNotificationToast({
-        title: 'Lỗi',
+        title: 'Error',
         message: 'Không thể gửi lệnh ngủ cho Mac: ' + String(err),
         timestamp: Date.now(),
         type: 'warning',
@@ -201,7 +279,7 @@ export default function MobileInputChrome({
   const triggerSoftReconnect = useCallback(async () => {
     setConnectionStatus('reconnecting');
     setNotificationToast({
-      title: '🔄 Kết nối mạng',
+      title: 'Reconnecting',
       message: 'Đang khôi phục kết nối tới Mac & terminal...',
       timestamp: Date.now(),
       type: 'info',
@@ -217,8 +295,8 @@ export default function MobileInputChrome({
         setConnectionStatus('online');
         fetchHealth();
         setNotificationToast({
-          title: '🟢 Đã kết nối',
-          message: 'Kết nối tới agent và Mac đã được khôi phục!',
+          title: 'Connected',
+          message: 'Kết nối tới agent và Mac đã được khôi phục.',
           timestamp: Date.now(),
           type: 'success',
         });
@@ -228,7 +306,7 @@ export default function MobileInputChrome({
 
     setConnectionStatus('offline');
     setNotificationToast({
-      title: '🔴 Mất kết nối',
+      title: 'Connection Lost',
       message: 'Chưa thể kết nối lại tới Mac. Vui lòng kiểm tra sóng/tunnel.',
       timestamp: Date.now(),
       type: 'warning',
@@ -243,8 +321,8 @@ export default function MobileInputChrome({
     const handleOffline = () => {
       setConnectionStatus('offline');
       setNotificationToast({
-        title: '🔴 Mất kết nối mạng',
-        message: 'Thiết bị của bạn vừa mất kết nối (4G/Wi-Fi ngắt).',
+        title: 'Offline',
+        message: 'Thiết bị của bạn vừa mất kết nối mạng.',
         timestamp: Date.now(),
         type: 'warning',
       });
@@ -258,6 +336,327 @@ export default function MobileInputChrome({
       window.removeEventListener('offline', handleOffline);
     };
   }, [triggerSoftReconnect]);
+
+  // -------------------------------------------------------------
+  // Feature 1: Stealth Mode (Tắt màn hình Mac từ xa)
+  // -------------------------------------------------------------
+  const handleSleepDisplay = useCallback(async () => {
+    try {
+      setNotificationToast({
+        title: 'Stealth Mode',
+        message: 'Đang tắt màn hình Mac (CPU & Agent vẫn chạy ngầm)...',
+        timestamp: Date.now(),
+        type: 'info',
+      });
+      const res = await fetch('/api/system-displaysleep', { method: 'POST' });
+      if (res.ok) {
+        setNotificationToast({
+          title: 'Stealth Active',
+          message: 'Màn hình Mac đã tắt hoàn toàn. Agent vẫn tiếp tục xử lý.',
+          timestamp: Date.now(),
+          type: 'success',
+        });
+      }
+    } catch (err) {
+      setNotificationToast({
+        title: 'Error',
+        message: 'Không thể tắt màn hình: ' + String(err),
+        timestamp: Date.now(),
+        type: 'warning',
+      });
+    }
+  }, []);
+
+  // -------------------------------------------------------------
+  // Feature 4: Tunnel Lease Timer (Hẹn giờ tự đóng Tunnel)
+  // -------------------------------------------------------------
+  const fetchTunnelTimer = useCallback(async () => {
+    try {
+      const res = await fetch('/api/tunnel-timer', { cache: 'no-store' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok) {
+          setTunnelTimer({
+            active: data.active,
+            remainingSeconds: data.remainingSeconds,
+            formatted: data.formatted,
+          });
+        }
+      }
+    } catch {}
+  }, []);
+
+  const handleSetTunnelTimer = useCallback(async (minutes: number) => {
+    try {
+      const res = await fetch('/api/tunnel-timer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ minutes }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setTunnelTimer({
+          active: data.active,
+          remainingSeconds: data.remainingSeconds,
+          formatted: data.formatted,
+        });
+        setNotificationToast({
+          title: minutes > 0 ? '⏱️ Đã đặt hẹn giờ tắt tunnel' : '⏱️ Đã hủy hẹn giờ',
+          message:
+            minutes > 0
+              ? `Tunnel sẽ tự động đóng sau ${minutes} phút (${data.formatted}).`
+              : 'Đã xóa bộ đếm thời gian tự tắt tunnel.',
+          timestamp: Date.now(),
+          type: 'info',
+        });
+      }
+    } catch (err) {
+      setNotificationToast({
+        title: 'Lỗi',
+        message: 'Không thể thiết lập hẹn giờ: ' + String(err),
+        timestamp: Date.now(),
+        type: 'warning',
+      });
+    }
+  }, []);
+
+  // Countdown seconds locally for real-time timer feedback
+  useEffect(() => {
+    if (!tunnelTimer?.active || tunnelTimer.remainingSeconds <= 0) return;
+    const iv = setInterval(() => {
+      setTunnelTimer((prev) => {
+        if (!prev || !prev.active || prev.remainingSeconds <= 1) {
+          fetchTunnelTimer();
+          return prev ? { ...prev, active: false, remainingSeconds: 0 } : null;
+        }
+        const rem = prev.remainingSeconds - 1;
+        const mins = Math.floor(rem / 60);
+        const secs = rem % 60;
+        const fmt = `${mins}m ${secs}s`;
+        return { ...prev, remainingSeconds: rem, formatted: fmt };
+      });
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [tunnelTimer?.active, fetchTunnelTimer]);
+
+  useEffect(() => {
+    fetchTunnelTimer();
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        fetchTunnelTimer();
+      }
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [fetchTunnelTimer]);
+
+  // -------------------------------------------------------------
+  // Feature 6: Terminal Scroll Tracking ("Jump to Bottom")
+  // -------------------------------------------------------------
+  useEffect(() => {
+    setIsScrolledUp(false);
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    const handleScrolledUp = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && typeof detail.isScrolledUp === 'boolean') {
+        if (!detail.sessionId || detail.sessionId === activeSessionId) {
+          setIsScrolledUp(detail.isScrolledUp);
+        }
+      }
+    };
+    window.addEventListener('omniterm:terminal-scrolled-up', handleScrolledUp);
+    return () => window.removeEventListener('omniterm:terminal-scrolled-up', handleScrolledUp);
+  }, [activeSessionId]);
+
+  const handleJumpToBottom = useCallback(() => {
+    window.dispatchEvent(
+      new CustomEvent('omniterm:scroll-to-bottom', {
+        detail: { sessionId: activeSessionId },
+      }),
+    );
+    setIsScrolledUp(false);
+  }, [activeSessionId]);
+
+  // -------------------------------------------------------------
+  // Feature 2: WebAuthn Biometric & PIN Security Lock
+  // -------------------------------------------------------------
+  // Auto-lock when hidden in background for autoLockMinutes
+  useEffect(() => {
+    if (!bioEnabled || autoLockMinutes <= 0) return;
+    let hiddenAt = 0;
+    const handleVis = () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now();
+      } else if (document.visibilityState === 'visible' && hiddenAt > 0) {
+        const elapsed = (Date.now() - hiddenAt) / 60000;
+        if (elapsed >= autoLockMinutes) {
+          setIsBioLocked(true);
+        }
+        hiddenAt = 0;
+      }
+    };
+    document.addEventListener('visibilitychange', handleVis);
+    return () => document.removeEventListener('visibilitychange', handleVis);
+  }, [bioEnabled, autoLockMinutes]);
+
+  const triggerBiometricUnlock = useCallback(async () => {
+    try {
+      setPinError('');
+      if (typeof window === 'undefined' || !window.PublicKeyCredential) {
+        throw new Error('WebAuthn không khả dụng');
+      }
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
+      const credIdBase64 = localStorage.getItem('omniterm.bioLock.credId');
+      const getOptions: CredentialRequestOptions = {
+        publicKey: {
+          challenge,
+          timeout: 60000,
+          userVerification: 'preferred',
+          allowCredentials: credIdBase64
+            ? [{ id: base64ToBuffer(credIdBase64), type: 'public-key' }]
+            : undefined,
+        },
+      };
+      const assertion = await navigator.credentials.get(getOptions);
+      if (assertion) {
+        setIsBioLocked(false);
+        setPinInput('');
+        setPinError('');
+        setNotificationToast({
+          title: 'Unlocked',
+          message: 'Xác thực sinh trắc học thành công.',
+          timestamp: Date.now(),
+          type: 'success',
+        });
+      }
+    } catch {
+      setPinError('Xác thực sinh trắc học bị hủy hoặc không khớp. Vui lòng thử lại hoặc dùng PIN.');
+    }
+  }, []);
+
+  const handlePinUnlock = useCallback(async () => {
+    if (!pinInput.trim()) return;
+    const hash = await sha256(pinInput.trim());
+    const storedHash = localStorage.getItem('omniterm.bioLock.pinHash');
+    if (storedHash && hash === storedHash) {
+      setIsBioLocked(false);
+      setPinInput('');
+      setPinError('');
+      setNotificationToast({
+        title: 'Unlocked',
+        message: 'Mở khóa bằng mã PIN thành công.',
+        timestamp: Date.now(),
+        type: 'success',
+      });
+    } else {
+      setPinError('Mã PIN không đúng. Vui lòng kiểm tra lại!');
+    }
+  }, [pinInput]);
+
+  const handleSavePinSetup = useCallback(async () => {
+    if (!setupPinValue || setupPinValue.length < 4) {
+      setSetupPinError('Mã PIN cần có ít nhất 4 chữ số');
+      return;
+    }
+    const hash = await sha256(setupPinValue.trim());
+    localStorage.setItem('omniterm.bioLock.pinHash', hash);
+    localStorage.setItem('omniterm.bioLock.enabled', 'true');
+    setBioEnabled(true);
+    setShowPinSetupModal(false);
+    setSetupPinValue('');
+    setSetupPinError('');
+
+    // Attempt WebAuthn registration
+    try {
+      if (typeof window !== 'undefined' && window.PublicKeyCredential) {
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+        const cred = (await navigator.credentials.create({
+          publicKey: {
+            challenge,
+            rp: { name: 'OmniTerm Remote' },
+            user: {
+              id: new Uint8Array([1, 7, 7, 1, 7]),
+              name: 'omniterm-user',
+              displayName: 'OmniTerm Remote Terminal',
+            },
+            pubKeyCredParams: [
+              { alg: -7, type: 'public-key' },
+              { alg: -257, type: 'public-key' },
+            ],
+            authenticatorSelection: {
+              authenticatorAttachment: 'platform',
+              userVerification: 'preferred',
+            },
+            timeout: 60000,
+          },
+        })) as PublicKeyCredential | null;
+
+        if (cred && cred.rawId) {
+          localStorage.setItem('omniterm.bioLock.credId', bufferToBase64(cred.rawId));
+        }
+      }
+    } catch {}
+
+    setNotificationToast({
+      title: 'Biometrics Active',
+      message: 'Đã kích hoạt bảo mật FaceID / TouchID và mã PIN dự phòng.',
+      timestamp: Date.now(),
+      type: 'success',
+    });
+  }, [setupPinValue]);
+
+  const handleDisableBioLock = useCallback(() => {
+    localStorage.removeItem('omniterm.bioLock.enabled');
+    localStorage.removeItem('omniterm.bioLock.pinHash');
+    localStorage.removeItem('omniterm.bioLock.credId');
+    setBioEnabled(false);
+    setIsBioLocked(false);
+    setNotificationToast({
+      title: 'Security Disabled',
+      message: 'Màn hình khóa bảo vệ đã được gỡ bỏ.',
+      timestamp: Date.now(),
+      type: 'info',
+    });
+  }, []);
+
+  // -------------------------------------------------------------
+  // Feature 5: PWA Installation & Guidance
+  // -------------------------------------------------------------
+  useEffect(() => {
+    if (typeof window !== 'undefined' && (window as any).__omniterm_pwa_prompt) {
+      setPwaInstallPrompt((window as any).__omniterm_pwa_prompt);
+    }
+    const handlePwaReady = () => {
+      if (typeof window !== 'undefined' && (window as any).__omniterm_pwa_prompt) {
+        setPwaInstallPrompt((window as any).__omniterm_pwa_prompt);
+      }
+    };
+    window.addEventListener('omniterm:pwa-installable', handlePwaReady);
+    return () => window.removeEventListener('omniterm:pwa-installable', handlePwaReady);
+  }, []);
+
+  const handleTriggerPwaInstall = useCallback(async () => {
+    if (pwaInstallPrompt) {
+      try {
+        pwaInstallPrompt.prompt();
+        const choice = await pwaInstallPrompt.userChoice;
+        if (choice && choice.outcome === 'accepted') {
+          setPwaInstallPrompt(null);
+          setNotificationToast({
+            title: 'Install PWA',
+            message: 'Đang cài đặt ứng dụng lên màn hình chính...',
+            timestamp: Date.now(),
+            type: 'success',
+          });
+        }
+      } catch {
+        setShowPwaModal(true);
+      }
+    } else {
+      setShowPwaModal(true);
+    }
+  }, [pwaInstallPrompt]);
 
   // -------------------------------------------------------------
   // Feature 6: Mobile Code Diff Viewer
@@ -290,8 +689,8 @@ export default function MobileInputChrome({
     sendData(getWindow(), 'y\r');
     setShowDiffModal(false);
     setNotificationToast({
-      title: '✅ Approve (y)',
-      message: 'Đã gửi xác nhận Apply thay đổi vào terminal!',
+      title: 'Approved (y)',
+      message: 'Đã xác nhận áp dụng thay đổi vào terminal.',
       timestamp: Date.now(),
       type: 'success',
     });
@@ -301,8 +700,8 @@ export default function MobileInputChrome({
     sendData(getWindow(), 'n\r');
     setShowDiffModal(false);
     setNotificationToast({
-      title: '❌ Reject (n)',
-      message: 'Đã gửi từ chối thay đổi vào terminal!',
+      title: 'Rejected (n)',
+      message: 'Đã từ chối thay đổi vào terminal.',
       timestamp: Date.now(),
       type: 'warning',
     });
@@ -605,85 +1004,113 @@ export default function MobileInputChrome({
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   };
 
-  // Quick Chips catalog
+  // Quick Chips catalog (Developer Keycap style — zero AI slop)
   const CHIPS: ActionChip[] = [
     {
       id: 'diff',
-      label: '🔍 Quick Diff',
-      ariaLabel: 'Xem Git Diff code thay đổi',
+      label: 'diff',
+      ariaLabel: 'View git diff',
       variant: 'accent',
       action: openDiffViewer,
     },
     {
       id: 'yes',
-      label: '✅ Approve (y)',
-      ariaLabel: 'Approve and run',
+      label: 'y',
+      ariaLabel: 'Approve (y)',
       variant: 'success',
       action: () => sendData(getWindow(), 'y\r'),
     },
     {
       id: 'no',
-      label: '❌ Reject (n)',
-      ariaLabel: 'Reject and run',
+      label: 'n',
+      ariaLabel: 'Reject (n)',
       variant: 'danger',
       action: () => sendData(getWindow(), 'n\r'),
     },
     {
       id: 'ctrl-c',
-      label: '🛑 Stop (^C)',
-      ariaLabel: 'Interrupt agent',
+      label: '^C',
+      ariaLabel: 'Interrupt agent (Ctrl+C)',
       variant: 'danger',
       action: () => sendData(getWindow(), ETX),
     },
     {
-      id: 'reconnect',
-      label: '🔄 Reconnect',
-      ariaLabel: 'Soft-reconnect terminal',
-      action: triggerSoftReconnect,
-    },
-    {
-      id: 'health',
-      label: '🔋 Mac Health',
-      ariaLabel: 'Xem pin và tình trạng Mac',
-      action: () => setShowHealthModal(true),
-    },
-    {
       id: 'tab',
-      label: '⇥ Tab',
+      label: 'tab ⇥',
       ariaLabel: 'Tab key',
       action: () => sendDescriptor(getWindow(), { id: 'tab', label: 'Tab', ariaLabel: 'Tab', type: 'bytes', data: TAB }),
     },
     {
       id: 'esc',
-      label: 'Esc',
+      label: 'esc',
       ariaLabel: 'Escape key',
       action: () => sendDescriptor(getWindow(), { id: 'esc', label: 'Esc', ariaLabel: 'Escape', type: 'bytes', data: ESC }),
     },
     {
       id: 'plan',
-      label: '📋 /plan',
+      label: '/plan',
       ariaLabel: 'Slash plan',
       variant: 'accent',
       action: () => sendData(getWindow(), '/plan '),
     },
     {
       id: 'goal',
-      label: '🎯 /goal',
+      label: '/goal',
       ariaLabel: 'Slash goal',
       variant: 'accent',
       action: () => sendData(getWindow(), '/goal '),
     },
     {
       id: 'agy',
-      label: '⚡ agy',
+      label: 'agy',
       ariaLabel: 'Start agy',
       action: () => sendData(getWindow(), 'agy\r'),
     },
     {
+      id: 'stealth',
+      label: 'stealth',
+      ariaLabel: 'Dim Mac display',
+      action: handleSleepDisplay,
+    },
+    {
+      id: 'lock-ui',
+      label: 'lock ui',
+      ariaLabel: 'Lock UI with FaceID or PIN',
+      action: () => {
+        if (!bioEnabled) {
+          setShowPinSetupModal(true);
+        } else {
+          setIsBioLocked(true);
+        }
+      },
+    },
+    {
+      id: 'reconnect',
+      label: 'reconnect',
+      ariaLabel: 'Soft-reconnect terminal',
+      action: triggerSoftReconnect,
+    },
+    {
+      id: 'health',
+      label: 'health',
+      ariaLabel: 'System health & telemetry',
+      action: () => setShowHealthModal(true),
+    },
+    ...(!isStandalone
+      ? [
+          {
+            id: 'install-pwa',
+            label: 'install',
+            ariaLabel: 'Install standalone app',
+            variant: 'accent' as const,
+            action: handleTriggerPwaInstall,
+          },
+        ]
+      : []),
+    {
       id: 'lock',
-      label: '🔒 Lock Mac',
+      label: 'lock tunnel',
       ariaLabel: 'Lock tunnel',
-      variant: 'warning',
       action: () => sendData(getWindow(), 'remote-tunnel off\r'),
     },
   ];
@@ -700,11 +1127,23 @@ export default function MobileInputChrome({
       {notificationToast && (
         <div style={S.toastBanner} onClick={() => setNotificationToast(null)}>
           <div style={S.toastIcon}>
-            {notificationToast.type === 'success'
-              ? '🎉'
-              : notificationToast.type === 'warning'
-                ? '⚠️'
-                : 'ℹ️'}
+            {notificationToast.type === 'success' ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            ) : notificationToast.type === 'warning' ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+                <line x1="12" y1="9" x2="12" y2="13" />
+                <line x1="12" y1="17" x2="12.01" y2="17" />
+              </svg>
+            ) : (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="16" x2="12" y2="12" />
+                <line x1="12" y1="8" x2="12.01" y2="8" />
+              </svg>
+            )}
           </div>
           <div style={S.toastBody}>
             <div style={S.toastTitle}>{notificationToast.title}</div>
@@ -719,7 +1158,7 @@ export default function MobileInputChrome({
               setNotificationToast(null);
             }}
           >
-            ✕
+            ×
           </button>
         </div>
       )}
@@ -730,12 +1169,38 @@ export default function MobileInputChrome({
           style={S.networkBanner}
           onClick={triggerSoftReconnect}
         >
-          {connectionStatus === 'reconnecting' ? (
-            <span>🔄 Đang khôi phục kết nối...</span>
-          ) : (
-            <span>🔴 Mất mạng (Chạm để kết nối lại 🔄)</span>
-          )}
+          <span
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: 3,
+              background: connectionStatus === 'reconnecting' ? '#f59e0b' : '#ef4444',
+              display: 'inline-block',
+              marginRight: 6,
+            }}
+          />
+          <span>
+            {connectionStatus === 'reconnecting'
+              ? 'Reconnecting to host…'
+              : 'Connection lost · Tap to reconnect'}
+          </span>
         </div>
+      )}
+
+      {/* ⬇️ FLOATING JUMP TO BOTTOM BUTTON (Feature 6) */}
+      {isScrolledUp && (
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label="Cuộn xuống cuối terminal"
+          style={{
+            ...S.jumpToBottomBtn,
+            bottom: `calc(${floatingBottom} + 96px)`,
+          }}
+          onClick={handleJumpToBottom}
+        >
+          <span style={{ fontSize: 16, lineHeight: 1 }}>↓</span>
+        </button>
       )}
 
       {/* 🕹️ FLOATING NAVIGATION PILL (▲ / ▼) */}
@@ -755,7 +1220,9 @@ export default function MobileInputChrome({
           onTouchStart={handlePreserveKeyboard(() => sendArrow('up'))}
           onClick={handlePreserveKeyboard(() => sendArrow('up'))}
         >
-          ▲
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="18 15 12 9 6 15" />
+          </svg>
         </button>
         <div style={S.navPillDivider} />
         <button
@@ -768,7 +1235,9 @@ export default function MobileInputChrome({
           onTouchStart={handlePreserveKeyboard(() => sendArrow('down'))}
           onClick={handlePreserveKeyboard(() => sendArrow('down'))}
         >
-          ▼
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
         </button>
       </div>
 
@@ -783,13 +1252,16 @@ export default function MobileInputChrome({
           <button
             type="button"
             tabIndex={-1}
-            aria-label="Mở thanh chat AI"
+            aria-label="Mở thanh nhập lệnh"
             style={S.fabLauncherBtn}
             onPointerDown={handlePreserveKeyboard(() => setBarOpen(true))}
             onTouchStart={handlePreserveKeyboard(() => setBarOpen(true))}
             onClick={handlePreserveKeyboard(() => setBarOpen(true))}
           >
-            💬
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="4 17 10 11 4 5" />
+              <line x1="12" y1="19" x2="20" y2="19" />
+            </svg>
           </button>
         </div>
       )}
@@ -805,43 +1277,86 @@ export default function MobileInputChrome({
         >
           {/* Top Status Bar: Remote Mac Health Pill */}
           <div style={S.topStatusBar}>
-            <div
+            <button
+              type="button"
+              tabIndex={-1}
               style={S.healthPill}
               onClick={() => setShowHealthModal(true)}
               title="Chạm để xem chi tiết tình trạng Mac"
             >
+              <span
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: 3,
+                  background: health?.tunnelActive ? '#22c55e' : '#a1a1aa',
+                  boxShadow: health?.tunnelActive ? '0 0 6px rgba(34, 197, 94, 0.6)' : 'none',
+                  display: 'inline-block',
+                  flexShrink: 0,
+                }}
+              />
               {health ? (
                 <>
                   <span style={S.healthItem}>
                     {health.battery.hasBattery
-                      ? `${health.battery.chargingState === 'charging' ? '⚡' : '🔋'} ${health.battery.percent}%`
-                      : '🔌 AC'}
+                      ? `${health.battery.percent}%${health.battery.chargingState === 'charging' ? '+' : ''}`
+                      : 'AC'}
                   </span>
-                  <span style={S.healthDot}>•</span>
-                  <span style={S.healthItem}>💾 RAM {health.memory.percent}%</span>
-                  <span style={S.healthDot}>•</span>
-                  <span style={S.healthItem}>⚡ CPU {health.cpu.percent}%</span>
-                  <span style={S.healthDot}>•</span>
-                  <span style={S.healthItem}>{health.tunnelActive ? '🚇 VM' : '🏠 Mac'}</span>
+                  <span style={S.healthDot}>·</span>
+                  <span style={S.healthItem}>{health.memory.percent}% mem</span>
+                  <span style={S.healthDot}>·</span>
+                  <span style={S.healthItem}>{health.cpu.percent}% cpu</span>
+                  {tunnelTimer?.active && (
+                    <>
+                      <span style={S.healthDot}>·</span>
+                      <span style={{ ...S.healthItem, color: '#38bdf8' }}>
+                        ⏱ {tunnelTimer.formatted || `${Math.ceil(tunnelTimer.remainingSeconds / 60)}m`}
+                      </span>
+                    </>
+                  )}
                 </>
               ) : (
-                <span style={S.healthItem}>💻 Mac Remote {healthLoading ? '...' : ''}</span>
+                <span style={S.healthItem}>
+                  mac remote {healthLoading ? '…' : ''}
+                </span>
               )}
-            </div>
-
-            {/* Quick Sleep Button */}
-            <button
-              type="button"
-              tabIndex={-1}
-              style={S.sleepShortcutBtn}
-              onClick={() => {
-                setConfirmSleep(true);
-                setShowHealthModal(true);
-              }}
-              title="Cho Mac ngủ"
-            >
-              💤 Ngủ
             </button>
+
+            {/* Top Right Control Strip */}
+            <div style={S.controlStrip}>
+              {!isStandalone && (
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  style={S.controlBtn}
+                  onClick={handleTriggerPwaInstall}
+                  title="Cài đặt OmniTerm thành Ứng dụng độc lập"
+                >
+                  install
+                </button>
+              )}
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.controlBtn}
+                onClick={handleSleepDisplay}
+                title="Tắt màn hình Mac (Stealth Mode)"
+              >
+                stealth
+              </button>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.controlBtn}
+                onClick={() => {
+                  setConfirmSleep(true);
+                  setShowHealthModal(true);
+                }}
+                title="Cho Mac ngủ"
+              >
+                sleep
+              </button>
+            </div>
           </div>
 
           {/* Hàng Quick Chips cuộn ngang */}
@@ -878,7 +1393,7 @@ export default function MobileInputChrome({
             })}
           </div>
 
-          {/* Khung nhập liệu Pill-shaped bo tròn như app ChatGPT/Gemini */}
+          {/* Khung nhập liệu Pill-shaped bo tròn */}
           <div style={S.promptPill}>
             {/* Nút Mic Voice-to-Text */}
             <button
@@ -890,14 +1405,22 @@ export default function MobileInputChrome({
               onTouchStart={handlePreserveKeyboard(toggleSpeechRecognition)}
               onClick={handlePreserveKeyboard(toggleSpeechRecognition)}
             >
-              {isListening ? '🔴' : '🎙️'}
+              {isListening ? (
+                <span style={{ width: 8, height: 8, borderRadius: 2, background: '#ef4444' }} />
+              ) : (
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                </svg>
+              )}
             </button>
 
             {/* Ô nhập Textarea */}
             <textarea
               ref={composeRef}
               rows={1}
-              placeholder={isListening ? 'Đang lắng nghe bạn nói...' : 'Nhắn tin cho agy hoặc bấm micro…'}
+              placeholder={isListening ? 'Đang lắng nghe...' : 'Nhắn tin cho agy hoặc bấm micro…'}
               autoCorrect="off"
               autoCapitalize="off"
               spellCheck={false}
@@ -919,7 +1442,7 @@ export default function MobileInputChrome({
               }}
             />
 
-            {/* Nút Gửi tròn xanh (Send button) */}
+            {/* Nút Gửi tròn (Send button) */}
             <button
               type="button"
               tabIndex={-1}
@@ -938,7 +1461,10 @@ export default function MobileInputChrome({
                 onSend();
               }}
             >
-              ➤
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="5" y1="12" x2="19" y2="12" />
+                <polyline points="12 5 19 12 12 19" />
+              </svg>
             </button>
 
             {/* Nút ẩn thanh chat */}
@@ -963,7 +1489,9 @@ export default function MobileInputChrome({
                 setBarOpen(false);
               }}
             >
-              ⌄
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
             </button>
           </div>
         </div>
@@ -974,14 +1502,14 @@ export default function MobileInputChrome({
         <div style={S.modalOverlay} onClick={() => setShowHealthModal(false)}>
           <div style={S.modalCard} onClick={(e) => e.stopPropagation()}>
             <div style={S.modalHeader}>
-              <div style={S.modalTitle}>💻 Tình trạng Mac từ xa</div>
+              <div style={S.modalTitle}>System Telemetry</div>
               <button
                 type="button"
                 tabIndex={-1}
                 style={S.modalCloseBtn}
                 onClick={() => setShowHealthModal(false)}
               >
-                ✕
+                ×
               </button>
             </div>
 
@@ -991,11 +1519,11 @@ export default function MobileInputChrome({
                 <div style={S.metricBlock}>
                   <div style={S.metricTitle}>
                     {health.battery.hasBattery
-                      ? `${health.battery.chargingState === 'charging' ? '⚡ Đang cắm sạc' : '🔋 Đang dùng pin'}`
-                      : '🔌 Cắm nguồn trực tiếp'}
+                      ? `${health.battery.chargingState === 'charging' ? 'Battery · Charging' : 'Battery · In use'}`
+                      : 'Power · AC Direct'}
                   </div>
                   <div style={S.metricValue}>
-                    {health.battery.percent}% {health.battery.timeRemaining ? `• ${health.battery.timeRemaining}` : ''}
+                    {health.battery.percent}% {health.battery.timeRemaining ? `· ${health.battery.timeRemaining}` : ''}
                   </div>
                   <div style={S.barTrack}>
                     <div
@@ -1015,7 +1543,7 @@ export default function MobileInputChrome({
 
                 {/* Memory Block */}
                 <div style={S.metricBlock}>
-                  <div style={S.metricTitle}>💾 Bộ nhớ RAM</div>
+                  <div style={S.metricTitle}>RAM Memory</div>
                   <div style={S.metricValue}>
                     {health.memory.usedGB} GB / {health.memory.totalGB} GB ({health.memory.percent}%)
                   </div>
@@ -1024,7 +1552,7 @@ export default function MobileInputChrome({
                       style={{
                         ...S.barFill,
                         width: `${health.memory.percent}%`,
-                        background: health.memory.percent > 85 ? '#f97316' : '#3b82f6',
+                        background: health.memory.percent > 85 ? '#f97316' : '#38bdf8',
                       }}
                     />
                   </div>
@@ -1033,22 +1561,147 @@ export default function MobileInputChrome({
                 {/* CPU & Uptime Block */}
                 <div style={S.metricRow}>
                   <div style={{ ...S.metricBlock, flex: 1, marginRight: 8 }}>
-                    <div style={S.metricTitle}>⚡ Tải CPU</div>
+                    <div style={S.metricTitle}>CPU Load</div>
                     <div style={S.metricValue}>
                       {health.cpu.percent}% ({health.cpu.cores} cores)
                     </div>
                   </div>
                   <div style={{ ...S.metricBlock, flex: 1 }}>
-                    <div style={S.metricTitle}>⏱️ Uptime</div>
+                    <div style={S.metricTitle}>Uptime</div>
                     <div style={S.metricValue}>{health.uptimeFormatted}</div>
                   </div>
                 </div>
 
                 {/* Tunnel Status */}
                 <div style={S.metricBlock}>
-                  <div style={S.metricTitle}>🚇 Reverse Tunnel (GCP VM)</div>
-                  <div style={S.metricValue}>
-                    {health.tunnelActive ? '🟢 Đang hoạt động (us-west1-b)' : '⚪ Tắt (Local Mac)'}
+                  <div style={S.metricTitle}>Reverse Tunnel (GCP VM)</div>
+                  <div style={{ ...S.metricValue, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span
+                      style={{
+                        width: 7,
+                        height: 7,
+                        borderRadius: 3.5,
+                        background: health.tunnelActive ? '#22c55e' : '#71717a',
+                        boxShadow: health.tunnelActive ? '0 0 6px rgba(34, 197, 94, 0.6)' : 'none',
+                        display: 'inline-block',
+                      }}
+                    />
+                    <span>{health.tunnelActive ? 'Active · us-west1-b' : 'Inactive · Local Mac'}</span>
+                  </div>
+                </div>
+
+                {/* Feature 4: Tunnel Lease Timer */}
+                <div style={S.metricBlock}>
+                  <div style={S.metricTitle}>Tunnel Lease Timer</div>
+                  <div style={{ ...S.metricValue, fontSize: 13, marginBottom: 8 }}>
+                    {tunnelTimer?.active ? (
+                      <span style={{ color: '#38bdf8' }}>
+                        Countdown active: <b>{tunnelTimer.formatted || `${Math.ceil(tunnelTimer.remainingSeconds / 60)}m`}</b> remaining
+                      </span>
+                    ) : (
+                      <span style={{ color: '#71717a' }}>No active lease timer (tunnel stays open until manual stop)</span>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    <button
+                      type="button"
+                      style={S.timerPresetBtn}
+                      onClick={() => handleSetTunnelTimer(30)}
+                    >
+                      30m
+                    </button>
+                    <button
+                      type="button"
+                      style={S.timerPresetBtn}
+                      onClick={() => handleSetTunnelTimer(60)}
+                    >
+                      1h
+                    </button>
+                    <button
+                      type="button"
+                      style={S.timerPresetBtn}
+                      onClick={() => handleSetTunnelTimer(120)}
+                    >
+                      2h
+                    </button>
+                    <button
+                      type="button"
+                      style={S.timerPresetBtn}
+                      onClick={() => handleSetTunnelTimer(240)}
+                    >
+                      4h
+                    </button>
+                    {tunnelTimer?.active && (
+                      <button
+                        type="button"
+                        style={{ ...S.timerPresetBtn, borderColor: '#ef4444', color: '#f87171' }}
+                        onClick={() => handleSetTunnelTimer(0)}
+                      >
+                        Cancel timer
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Feature 2: Biometric & PIN Security */}
+                <div style={S.metricBlock}>
+                  <div style={S.metricTitle}>Biometric & PIN Security</div>
+                  <div style={{ ...S.metricValue, fontSize: 13, marginBottom: 8 }}>
+                    {bioEnabled ? (
+                      <span style={{ color: '#4ade80' }}>
+                        Active · Protected with Biometrics & PIN
+                      </span>
+                    ) : (
+                      <span style={{ color: '#71717a' }}>Protection not configured</span>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                    {bioEnabled ? (
+                      <>
+                        <button
+                          type="button"
+                          style={{
+                            ...S.timerPresetBtn,
+                            background: 'rgba(239, 68, 68, 0.15)',
+                            borderColor: 'rgba(239, 68, 68, 0.3)',
+                            color: '#fca5a5',
+                          }}
+                          onClick={() => {
+                            setShowHealthModal(false);
+                            setIsBioLocked(true);
+                          }}
+                        >
+                          Lock UI now
+                        </button>
+                        <button
+                          type="button"
+                          style={S.timerPresetBtn}
+                          onClick={() => setShowPinSetupModal(true)}
+                        >
+                          Change PIN
+                        </button>
+                        <button
+                          type="button"
+                          style={{ ...S.timerPresetBtn, color: '#94a3b8' }}
+                          onClick={handleDisableBioLock}
+                        >
+                          Disable
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        style={{
+                          ...S.timerPresetBtn,
+                          background: 'rgba(56, 189, 248, 0.12)',
+                          borderColor: 'rgba(56, 189, 248, 0.25)',
+                          color: '#38bdf8',
+                        }}
+                        onClick={() => setShowPinSetupModal(true)}
+                      >
+                        Configure Biometrics / PIN
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1056,9 +1709,9 @@ export default function MobileInputChrome({
                 {confirmSleep ? (
                   <div style={S.confirmBox}>
                     <div style={S.confirmText}>
-                      ⚠️ <b>Xác nhận đưa Mac vào giấc ngủ?</b>
+                      <b>Confirm Sleep Mode?</b>
                       <br />
-                      Khi Mac ngủ, kết nối từ xa sẽ tạm ngắt cho đến khi Mac được đánh thức.
+                      Remote Mac will enter sleep. The reverse tunnel will disconnect until the host wakes up.
                     </div>
                     <div style={S.confirmBtns}>
                       <button
@@ -1067,7 +1720,7 @@ export default function MobileInputChrome({
                         style={S.confirmSleepBtn}
                         onClick={handleSleepMac}
                       >
-                        💤 Xác nhận ngủ ngay
+                        Sleep Mac now
                       </button>
                       <button
                         type="button"
@@ -1075,7 +1728,7 @@ export default function MobileInputChrome({
                         style={S.confirmCancelBtn}
                         onClick={() => setConfirmSleep(false)}
                       >
-                        Hủy
+                        Cancel
                       </button>
                     </div>
                   </div>
@@ -1087,7 +1740,24 @@ export default function MobileInputChrome({
                       style={S.refreshBtn}
                       onClick={fetchHealth}
                     >
-                      🔄 Làm mới
+                      Refresh
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      style={{
+                        ...S.sleepActionBtn,
+                        background: 'rgba(255, 255, 255, 0.05)',
+                        borderColor: 'rgba(255, 255, 255, 0.12)',
+                        color: '#d4d4d8',
+                      }}
+                      onClick={() => {
+                        handleSleepDisplay();
+                        setShowHealthModal(false);
+                      }}
+                      title="Dim Mac display without suspending background jobs"
+                    >
+                      Stealth Display
                     </button>
                     <button
                       type="button"
@@ -1095,14 +1765,230 @@ export default function MobileInputChrome({
                       style={S.sleepActionBtn}
                       onClick={() => setConfirmSleep(true)}
                     >
-                      💤 Cho Mac ngủ
+                      Sleep Mac
                     </button>
                   </div>
                 )}
               </div>
             ) : (
-              <div style={S.modalLoading}>Đang kiểm tra kết nối tới Mac...</div>
+              <div style={S.modalLoading}>Checking host telemetry…</div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ⚙️ MODAL: SETUP BIOMETRIC & PIN (Feature 2) */}
+      {showPinSetupModal && (
+        <div style={S.modalOverlay} onClick={() => setShowPinSetupModal(false)}>
+          <div style={S.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={S.modalHeader}>
+              <div style={S.modalTitle}>Biometric & PIN Setup</div>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.modalCloseBtn}
+                onClick={() => setShowPinSetupModal(false)}
+              >
+                ×
+              </button>
+            </div>
+            <div style={S.modalBody}>
+              <div style={S.metricTitle}>
+                Set a numeric PIN (4-8 digits) as backup authentication:
+              </div>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleSavePinSetup();
+                }}
+                style={{ marginTop: 12 }}
+              >
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={8}
+                  placeholder="e.g. 123456"
+                  value={setupPinValue}
+                  onChange={(e) => {
+                    setSetupPinValue(e.target.value);
+                    setSetupPinError('');
+                  }}
+                  style={{ ...S.pinInput, width: '100%' }}
+                  autoFocus
+                />
+                {setupPinError && (
+                  <div style={{ ...S.pinErrorText, textAlign: 'left', marginTop: 8 }}>
+                    {setupPinError}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 10, marginTop: 18 }}>
+                  <button
+                    type="submit"
+                    style={{
+                      ...S.sleepActionBtn,
+                      background: '#f4f4f5',
+                      borderColor: '#ffffff',
+                      color: '#090a0f',
+                    }}
+                  >
+                    Enable Protection
+                  </button>
+                  <button
+                    type="button"
+                    style={S.refreshBtn}
+                    onClick={() => setShowPinSetupModal(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 🛡️ BIOMETRIC & PIN LOCK FULLSCREEN OVERLAY (Feature 2) */}
+      {isBioLocked && (
+        <div style={S.bioLockOverlay}>
+          <div style={S.bioLockCard}>
+            <div style={S.bioLockIcon}>
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#e4e4e7" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+                <rect width="18" height="11" x="3" y="11" rx="2" ry="2" />
+                <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+              </svg>
+            </div>
+            <div style={S.bioLockTitle}>OmniTerm Security Shield</div>
+            <div style={S.bioLockSubtitle}>
+              Remote session is locked. Authenticate using biometrics or backup PIN.
+            </div>
+
+            {/* FaceID / TouchID Main Button */}
+            <button
+              type="button"
+              style={S.bioAuthBtn}
+              onClick={triggerBiometricUnlock}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: 8 }}>
+                <path d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04A18.06 18.06 0 0 1 5 11c0-4.418 3.582-8 8-8s8 3.582 8 8a17.9 17.9 0 0 1-1.048 6" />
+                <path d="M9 11a3 3 0 1 1 6 0c0 1.657-.343 3.234-.969 4.664" />
+              </svg>
+              Unlock with Biometrics
+            </button>
+
+            {/* Divider */}
+            <div style={S.bioDividerRow}>
+              <div style={S.bioDividerLine} />
+              <span style={S.bioDividerText}>or enter backup PIN</span>
+              <div style={S.bioDividerLine} />
+            </div>
+
+            {/* PIN Form */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handlePinUnlock();
+              }}
+              style={S.pinForm}
+            >
+              <input
+                type="password"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={8}
+                placeholder="PIN"
+                value={pinInput}
+                onChange={(e) => {
+                  setPinInput(e.target.value);
+                  setPinError('');
+                }}
+                style={S.pinInput}
+              />
+              <button type="submit" style={S.pinSubmitBtn}>
+                Unlock
+              </button>
+            </form>
+
+            {pinError && <div style={S.pinErrorText}>{pinError}</div>}
+          </div>
+        </div>
+      )}
+
+      {/* 📲 MODAL: PWA INSTALLATION GUIDE (Feature 5) */}
+      {showPwaModal && (
+        <div style={S.modalOverlay} onClick={() => setShowPwaModal(false)}>
+          <div style={S.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={S.modalHeader}>
+              <div style={S.modalTitle}>Install OmniTerm PWA</div>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.modalCloseBtn}
+                onClick={() => setShowPwaModal(false)}
+              >
+                ×
+              </button>
+            </div>
+            <div style={S.modalBody}>
+              <div style={{ textAlign: 'center', marginBottom: 16 }}>
+                <img
+                  src="/apple-touch-icon.png"
+                  alt="OmniTerm Icon"
+                  style={{ width: 56, height: 56, borderRadius: 14, boxShadow: '0 4px 16px rgba(0,0,0,0.4)' }}
+                />
+                <div style={{ fontSize: 15, fontWeight: 600, color: '#f8fafc', marginTop: 10 }}>
+                  OmniTerm Remote Agent
+                </div>
+                <div style={{ fontSize: 12, color: '#71717a' }}>
+                  Standalone fullscreen workspace without browser URL bar
+                </div>
+              </div>
+
+              {pwaInstallPrompt && (
+                <div style={{ textAlign: 'center', margin: '14px 0' }}>
+                  <button
+                    type="button"
+                    style={{ ...S.bioAuthBtn, background: '#f4f4f5', color: '#090a0f' }}
+                    onClick={handleTriggerPwaInstall}
+                  >
+                    Install to Home Screen
+                  </button>
+                </div>
+              )}
+
+              {/* Instructions */}
+              <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 12, padding: 12, marginBottom: 10, border: '1px solid rgba(255, 255, 255, 0.06)' }}>
+                <div style={{ fontWeight: 600, color: '#e4e4e7', fontSize: 12, marginBottom: 4 }}>
+                  iOS Safari
+                </div>
+                <div style={{ fontSize: 12, color: '#a1a1aa', lineHeight: 1.5 }}>
+                  1. Open in <b>Safari</b>.<br />
+                  2. Tap <b>Share</b> in Safari bottom bar.<br />
+                  3. Select <b>Add to Home Screen</b>.<br />
+                  4. Tap <b>Add</b>.
+                </div>
+              </div>
+
+              <div style={{ background: 'rgba(255, 255, 255, 0.04)', borderRadius: 12, padding: 12, border: '1px solid rgba(255, 255, 255, 0.06)' }}>
+                <div style={{ fontWeight: 600, color: '#e4e4e7', fontSize: 12, marginBottom: 4 }}>
+                  Android Chrome / Samsung Internet
+                </div>
+                <div style={{ fontSize: 12, color: '#a1a1aa', lineHeight: 1.5 }}>
+                  1. Tap <b>⋮</b> (menu) at top-right.<br />
+                  2. Select <b>Install App</b> or <b>Add to Home Screen</b>.
+                </div>
+              </div>
+
+              <div style={{ marginTop: 16 }}>
+                <button
+                  type="button"
+                  style={S.refreshBtn}
+                  onClick={() => setShowPwaModal(false)}
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1114,12 +2000,12 @@ export default function MobileInputChrome({
             {/* Diff Header */}
             <div style={S.diffHeader}>
               <div style={S.diffHeaderLeft}>
-                <span style={S.diffTitle}>🔍 Git Diff</span>
+                <span style={S.diffTitle}>git diff</span>
                 {diffData && (
                   <span style={S.diffStatsBadge}>
                     <span style={{ color: '#4ade80' }}>+{diffData.summary.additions}</span>{' '}
                     <span style={{ color: '#f87171' }}>-{diffData.summary.deletions}</span>{' '}
-                    <span style={{ color: '#94a3b8' }}>({diffData.files.length} files)</span>
+                    <span style={{ color: '#71717a' }}>({diffData.files.length} files)</span>
                   </span>
                 )}
               </div>
@@ -1129,9 +2015,14 @@ export default function MobileInputChrome({
                   tabIndex={-1}
                   style={S.diffRefreshBtn}
                   onClick={fetchDiff}
-                  title="Tải lại Diff"
+                  title="Reload diff"
                 >
-                  🔄
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                    <path d="M3 3v5h5" />
+                    <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                    <path d="M16 21h5v-5" />
+                  </svg>
                 </button>
                 <button
                   type="button"
@@ -1139,7 +2030,7 @@ export default function MobileInputChrome({
                   style={S.diffCloseBtn}
                   onClick={() => setShowDiffModal(false)}
                 >
-                  ✕
+                  ×
                 </button>
               </div>
             </div>
@@ -1170,21 +2061,21 @@ export default function MobileInputChrome({
             {/* Diff Viewer Body */}
             <div style={S.diffBody}>
               {diffLoading ? (
-                <div style={S.diffEmptyState}>Đang tải code diff...</div>
+                <div style={S.diffEmptyState}>Loading git diff…</div>
               ) : !diffData || !diffData.isGit ? (
-                <div style={S.diffEmptyState}>Thư mục hiện tại không phải Git repository.</div>
+                <div style={S.diffEmptyState}>Workspace is not a Git repository.</div>
               ) : diffData.files.length === 0 ? (
                 <div style={S.diffEmptyState}>
-                  ✨ Working tree clean! Không có thay đổi nào trong git.
+                  Working tree clean. No changes detected.
                 </div>
               ) : activeDiffFile ? (
                 <div style={S.diffCodeContainer}>
                   <div style={S.diffFilePathHeader}>
-                    📄 <b>{activeDiffFile.file}</b> ({activeDiffFile.status})
+                    <b>{activeDiffFile.file}</b> ({activeDiffFile.status})
                   </div>
                   {activeDiffFile.lines.length === 0 ? (
                     <div style={S.diffFileUntracked}>
-                      Tệp chưa được theo dõi (untracked file).
+                      Untracked file.
                     </div>
                   ) : (
                     <pre style={S.diffPre}>
@@ -1226,7 +2117,7 @@ export default function MobileInputChrome({
                 style={S.diffApproveBtn}
                 onClick={handleDiffApprove}
               >
-                ✅ Approve (y)
+                approve (y)
               </button>
               <button
                 type="button"
@@ -1234,7 +2125,7 @@ export default function MobileInputChrome({
                 style={S.diffRejectBtn}
                 onClick={handleDiffReject}
               >
-                ❌ Reject (n)
+                reject (n)
               </button>
               <button
                 type="button"
@@ -1242,7 +2133,7 @@ export default function MobileInputChrome({
                 style={S.diffDismissBtn}
                 onClick={() => setShowDiffModal(false)}
               >
-                Đóng
+                close
               </button>
             </div>
           </div>
@@ -1291,21 +2182,21 @@ function playNotificationChime(): void {
 const BAR_Z = 120;
 
 const S: Record<string, React.CSSProperties> = {
-  // 🕹️ Floating Nav Pill (▲ / ▼) — Glassmorphism
+  // Navigation Pill (▲ / ▼) — Minimal Obsidian Keycap
   navPillContainer: {
     position: 'fixed',
-    right: 14,
+    right: 12,
     zIndex: BAR_Z + 10,
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
-    width: 48,
-    borderRadius: 24,
-    background: 'rgba(28, 30, 38, 0.88)',
+    width: 36,
+    borderRadius: 18,
+    background: 'rgba(20, 22, 28, 0.92)',
     backdropFilter: 'blur(16px)',
     WebkitBackdropFilter: 'blur(16px)',
-    border: '1px solid rgba(255, 255, 255, 0.15)',
-    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.25)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.45), 0 2px 4px rgba(0, 0, 0, 0.25)',
     overflow: 'hidden',
     transition: 'bottom 0.2s cubic-bezier(0.2, 0, 0, 1)',
     userSelect: 'none',
@@ -1314,11 +2205,11 @@ const S: Record<string, React.CSSProperties> = {
   },
   navPillBtnTop: {
     width: '100%',
-    height: 44,
+    height: 36,
     border: 'none',
     background: 'transparent',
-    color: '#e2e8f0',
-    fontSize: 16,
+    color: '#a1a1aa',
+    fontSize: 13,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
@@ -1330,17 +2221,17 @@ const S: Record<string, React.CSSProperties> = {
     touchAction: 'manipulation',
   },
   navPillDivider: {
-    width: '70%',
+    width: '60%',
     height: 1,
-    background: 'rgba(255, 255, 255, 0.12)',
+    background: 'rgba(255, 255, 255, 0.08)',
   },
   navPillBtnBottom: {
     width: '100%',
-    height: 44,
+    height: 36,
     border: 'none',
     background: 'transparent',
-    color: '#e2e8f0',
-    fontSize: 16,
+    color: '#a1a1aa',
+    fontSize: 13,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
@@ -1352,30 +2243,29 @@ const S: Record<string, React.CSSProperties> = {
     touchAction: 'manipulation',
   },
 
-  // 🔘 FAB Launcher
+  // FAB Launcher (Clean Terminal Prompt Icon)
   fabLauncher: {
     position: 'fixed',
-    left: 14,
+    left: 12,
     zIndex: BAR_Z + 10,
   },
   fabLauncherBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    background: 'rgba(28, 30, 38, 0.92)',
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    background: 'rgba(20, 22, 28, 0.92)',
     backdropFilter: 'blur(12px)',
-    border: '1px solid rgba(255, 255, 255, 0.15)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
     boxShadow: '0 4px 16px rgba(0, 0, 0, 0.4)',
-    fontSize: 20,
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    color: '#e2e8f0',
+    color: '#e4e4e7',
     outline: 'none',
   },
 
-  // 💬 ChatGPT / Gemini Style Chat Container
+  // Developer Bottom Input Bar
   chatBarContainer: {
     position: 'fixed',
     left: 0,
@@ -1384,16 +2274,16 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     gap: 6,
-    padding: '6px 12px calc(8px + env(safe-area-inset-bottom, 0px))',
-    background: 'linear-gradient(to top, rgba(13, 14, 18, 0.98) 80%, rgba(13, 14, 18, 0.8) 100%)',
+    padding: '6px 10px calc(6px + env(safe-area-inset-bottom, 0px))',
+    background: 'rgba(13, 15, 20, 0.97)',
     backdropFilter: 'blur(20px)',
     WebkitBackdropFilter: 'blur(20px)',
     borderTop: '1px solid rgba(255, 255, 255, 0.08)',
-    boxShadow: '0 -4px 24px rgba(0, 0, 0, 0.5)',
+    boxShadow: '0 -4px 20px rgba(0, 0, 0, 0.6)',
     transition: 'bottom 0.2s cubic-bezier(0.2, 0, 0, 1)',
   },
 
-  // Top Status Bar in Mobile Chrome
+  // Top Status Bar: Telemetry & Controls
   topStatusBar: {
     display: 'flex',
     alignItems: 'center',
@@ -1401,38 +2291,72 @@ const S: Record<string, React.CSSProperties> = {
     padding: '0 2px',
   },
   healthPill: {
-    display: 'flex',
+    display: 'inline-flex',
     alignItems: 'center',
     gap: 6,
-    padding: '3px 10px',
-    borderRadius: 12,
-    background: 'rgba(255, 255, 255, 0.06)',
-    border: '1px solid rgba(255, 255, 255, 0.08)',
+    padding: '0 8px',
+    height: 22,
+    borderRadius: 5,
+    background: 'rgba(255, 255, 255, 0.04)',
+    border: '1px solid rgba(255, 255, 255, 0.07)',
     fontSize: 11,
-    color: '#94a3b8',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontVariantNumeric: 'tabular-nums',
+    color: '#a1a1aa',
     cursor: 'pointer',
+    outline: 'none',
+    userSelect: 'none',
+    WebkitTapHighlightColor: 'transparent',
   },
   healthItem: {
     fontWeight: 500,
   },
   healthDot: {
-    opacity: 0.4,
+    opacity: 0.35,
+    margin: '0 1px',
   },
-  sleepShortcutBtn: {
-    background: 'rgba(239, 68, 68, 0.12)',
-    border: '1px solid rgba(239, 68, 68, 0.25)',
-    color: '#f87171',
-    borderRadius: 12,
-    padding: '3px 8px',
+  controlStrip: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+  },
+  controlBtn: {
+    height: 22,
+    padding: '0 8px',
+    borderRadius: 5,
+    background: 'rgba(255, 255, 255, 0.04)',
+    border: '1px solid rgba(255, 255, 255, 0.07)',
+    color: '#a1a1aa',
     fontSize: 11,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     fontWeight: 500,
     cursor: 'pointer',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    outline: 'none',
+    userSelect: 'none',
+    WebkitTapHighlightColor: 'transparent',
+    transition: 'all 0.15s ease',
+  },
+  sleepShortcutBtn: {
+    height: 22,
+    padding: '0 8px',
+    borderRadius: 5,
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
+    color: '#f87171',
+    fontSize: 11,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontWeight: 500,
+    cursor: 'pointer',
+    outline: 'none',
   },
 
-  // Hàng Quick Chips cuộn ngang
+  // Hàng Quick Chips cuộn ngang — Monospace Keycaps
   chipsRow: {
     display: 'flex',
-    gap: 6,
+    gap: 5,
     overflowX: 'auto',
     overflowY: 'hidden',
     paddingBottom: 2,
@@ -1442,12 +2366,14 @@ const S: Record<string, React.CSSProperties> = {
   },
   chipBase: {
     flexShrink: 0,
-    padding: '5px 10px',
-    borderRadius: 14,
-    background: 'rgba(255, 255, 255, 0.07)',
-    border: '1px solid rgba(255, 255, 255, 0.1)',
-    color: '#cbd5e1',
-    fontSize: 12,
+    padding: '4px 9px',
+    borderRadius: 6,
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.04)',
+    color: '#d4d4d8',
+    fontSize: 11.5,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     fontWeight: 500,
     cursor: 'pointer',
     userSelect: 'none',
@@ -1458,113 +2384,110 @@ const S: Record<string, React.CSSProperties> = {
     outline: 'none',
   },
   chip_success: {
-    background: 'rgba(34, 197, 94, 0.15)',
-    border: '1px solid rgba(34, 197, 94, 0.35)',
+    background: 'rgba(34, 197, 94, 0.1)',
+    border: '1px solid rgba(34, 197, 94, 0.25)',
     color: '#4ade80',
-    fontWeight: 600,
   },
   chip_danger: {
-    background: 'rgba(239, 68, 68, 0.15)',
-    border: '1px solid rgba(239, 68, 68, 0.35)',
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
     color: '#f87171',
   },
   chip_accent: {
-    background: 'rgba(56, 189, 248, 0.15)',
-    border: '1px solid rgba(56, 189, 248, 0.35)',
+    background: 'rgba(56, 189, 248, 0.1)',
+    border: '1px solid rgba(56, 189, 248, 0.25)',
     color: '#38bdf8',
   },
   chip_warning: {
-    background: 'rgba(234, 179, 8, 0.15)',
-    border: '1px solid rgba(234, 179, 8, 0.35)',
-    color: '#fde047',
+    background: 'rgba(234, 179, 8, 0.1)',
+    border: '1px solid rgba(234, 179, 8, 0.25)',
+    color: '#fbbf24',
   },
 
-  // Khung nhập Prompt dạng Pill
+  // Khung nhập Prompt dạng Squircle
   promptPill: {
     display: 'flex',
     alignItems: 'center',
     gap: 6,
-    padding: '4px 6px',
-    background: 'rgba(255, 255, 255, 0.06)',
-    border: '1px solid rgba(255, 255, 255, 0.12)',
-    borderRadius: 24,
-    boxShadow: 'inset 0 1px 2px rgba(0, 0, 0, 0.25)',
+    padding: '3px 6px',
+    background: 'rgba(255, 255, 255, 0.04)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    borderRadius: 14,
+    boxShadow: 'inset 0 1px 2px rgba(0, 0, 0, 0.3)',
   },
   micBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    border: 'none',
-    background: 'rgba(255, 255, 255, 0.08)',
-    color: '#e2e8f0',
-    fontSize: 16,
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    border: '1px solid rgba(255, 255, 255, 0.06)',
+    background: 'rgba(255, 255, 255, 0.04)',
+    color: '#a1a1aa',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     flexShrink: 0,
+    outline: 'none',
   },
   micListening: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    border: 'none',
-    background: 'rgba(239, 68, 68, 0.3)',
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    background: 'rgba(239, 68, 68, 0.15)',
     color: '#ef4444',
-    fontSize: 16,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     flexShrink: 0,
-    animation: 'pulse 1.2s infinite',
+    outline: 'none',
   },
   promptInput: {
     flex: 1,
     minHeight: 22,
     maxHeight: 120,
-    padding: '6px 8px',
+    padding: '5px 8px',
     border: 'none',
     background: 'transparent',
-    color: '#f8fafc',
-    fontSize: 14,
+    color: '#f4f4f5',
+    fontSize: 13.5,
     lineHeight: '20px',
     resize: 'none',
     outline: 'none',
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
   },
   sendBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
+    width: 32,
+    height: 32,
+    borderRadius: 8,
     border: 'none',
-    background: '#38bdf8',
-    color: '#0f172a',
-    fontSize: 15,
-    fontWeight: 'bold',
+    background: '#f4f4f5',
+    color: '#090a0f',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     flexShrink: 0,
-    boxShadow: '0 2px 8px rgba(56, 189, 248, 0.4)',
+    boxShadow: '0 1px 4px rgba(0, 0, 0, 0.3)',
+    outline: 'none',
   },
   hideBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
+    width: 26,
+    height: 26,
+    borderRadius: 6,
     border: 'none',
     background: 'transparent',
-    color: '#94a3b8',
-    fontSize: 16,
+    color: '#71717a',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     flexShrink: 0,
+    outline: 'none',
   },
 
-  // 🔔 Toast Notification Banner
+  // Toast Notification Banner — Obsidian Card
   toastBanner: {
     position: 'fixed',
     top: 14,
@@ -1575,29 +2498,32 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     gap: 10,
     padding: '10px 14px',
-    borderRadius: 14,
-    background: 'rgba(24, 26, 34, 0.95)',
+    borderRadius: 10,
+    background: 'rgba(18, 20, 26, 0.96)',
     backdropFilter: 'blur(20px)',
     WebkitBackdropFilter: 'blur(20px)',
-    border: '1px solid rgba(56, 189, 248, 0.3)',
-    boxShadow: '0 10px 30px rgba(0, 0, 0, 0.6)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    boxShadow: '0 8px 24px rgba(0, 0, 0, 0.6)',
     animation: 'slideDown 0.3s ease-out',
   },
   toastIcon: {
-    fontSize: 20,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
   },
   toastBody: {
     flex: 1,
     minWidth: 0,
   },
   toastTitle: {
-    fontSize: 13,
+    fontSize: 12.5,
     fontWeight: 600,
-    color: '#f8fafc',
+    color: '#f4f4f5',
   },
   toastMessage: {
-    fontSize: 12,
-    color: '#cbd5e1',
+    fontSize: 11.5,
+    color: '#a1a1aa',
     whiteSpace: 'nowrap',
     overflow: 'hidden',
     textOverflow: 'ellipsis',
@@ -1605,32 +2531,37 @@ const S: Record<string, React.CSSProperties> = {
   toastClose: {
     border: 'none',
     background: 'transparent',
-    color: '#94a3b8',
-    fontSize: 14,
+    color: '#71717a',
+    fontSize: 16,
     cursor: 'pointer',
     padding: 4,
+    lineHeight: 1,
   },
 
-  // 🔴 Network Offline Banner
+  // Network Banner — Minimal Status Dot
   networkBanner: {
     position: 'fixed',
-    top: 60,
+    top: 14,
     left: 20,
     right: 20,
     zIndex: BAR_Z + 90,
     padding: '6px 12px',
-    borderRadius: 20,
-    background: 'rgba(239, 68, 68, 0.92)',
+    borderRadius: 8,
+    background: 'rgba(24, 26, 32, 0.95)',
     backdropFilter: 'blur(10px)',
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: 600,
-    textAlign: 'center',
-    boxShadow: '0 4px 16px rgba(239, 68, 68, 0.4)',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    color: '#f4f4f5',
+    fontSize: 11,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontWeight: 500,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.4)',
     cursor: 'pointer',
   },
 
-  // 💻 Modal Styles (Feature 3: System Health)
+  // Modal Styles (Obsidian Developer Surface)
   modalOverlay: {
     position: 'fixed',
     inset: 0,
@@ -1646,10 +2577,10 @@ const S: Record<string, React.CSSProperties> = {
   modalCard: {
     width: '100%',
     maxWidth: 380,
-    borderRadius: 20,
-    background: '#161821',
-    border: '1px solid rgba(255, 255, 255, 0.12)',
-    boxShadow: '0 20px 40px rgba(0, 0, 0, 0.7)',
+    borderRadius: 14,
+    background: '#101216',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    boxShadow: '0 24px 48px rgba(0, 0, 0, 0.8)',
     overflow: 'hidden',
     display: 'flex',
     flexDirection: 'column',
@@ -1658,91 +2589,98 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: '14px 16px',
-    borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+    padding: '12px 16px',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
   },
   modalTitle: {
-    fontSize: 15,
+    fontSize: 13.5,
     fontWeight: 600,
-    color: '#f8fafc',
+    color: '#f4f4f5',
   },
   modalCloseBtn: {
     border: 'none',
     background: 'transparent',
-    color: '#94a3b8',
+    color: '#71717a',
     fontSize: 16,
     cursor: 'pointer',
+    lineHeight: 1,
   },
   modalBody: {
-    padding: '16px',
+    padding: '14px 16px',
     display: 'flex',
     flexDirection: 'column',
-    gap: 12,
+    gap: 10,
   },
   metricBlock: {
     padding: '10px 12px',
-    borderRadius: 12,
-    background: 'rgba(255, 255, 255, 0.04)',
-    border: '1px solid rgba(255, 255, 255, 0.06)',
+    borderRadius: 8,
+    background: 'rgba(255, 255, 255, 0.03)',
+    border: '1px solid rgba(255, 255, 255, 0.05)',
   },
   metricRow: {
     display: 'flex',
   },
   metricTitle: {
-    fontSize: 12,
-    color: '#94a3b8',
+    fontSize: 11,
+    color: '#71717a',
+    textTransform: 'uppercase',
+    letterSpacing: '0.04em',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     marginBottom: 4,
   },
   metricValue: {
-    fontSize: 14,
-    fontWeight: 600,
-    color: '#f8fafc',
+    fontSize: 13,
+    fontWeight: 500,
+    color: '#f4f4f5',
+    fontVariantNumeric: 'tabular-nums',
   },
   barTrack: {
     width: '100%',
-    height: 6,
-    borderRadius: 3,
+    height: 4,
+    borderRadius: 2,
     background: 'rgba(255, 255, 255, 0.08)',
     marginTop: 6,
     overflow: 'hidden',
   },
   barFill: {
     height: '100%',
-    borderRadius: 3,
+    borderRadius: 2,
     transition: 'width 0.3s ease',
   },
   modalActions: {
     display: 'flex',
-    gap: 10,
-    marginTop: 6,
+    gap: 8,
+    marginTop: 4,
   },
   refreshBtn: {
     flex: 1,
-    padding: '10px',
-    borderRadius: 12,
-    border: '1px solid rgba(255, 255, 255, 0.15)',
-    background: 'rgba(255, 255, 255, 0.08)',
-    color: '#e2e8f0',
-    fontSize: 13,
+    padding: '8px 12px',
+    borderRadius: 8,
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    background: 'rgba(255, 255, 255, 0.05)',
+    color: '#e4e4e7',
+    fontSize: 12,
     fontWeight: 500,
     cursor: 'pointer',
+    outline: 'none',
   },
   sleepActionBtn: {
     flex: 1,
-    padding: '10px',
-    borderRadius: 12,
-    border: '1px solid rgba(239, 68, 68, 0.3)',
-    background: 'rgba(239, 68, 68, 0.15)',
+    padding: '8px 12px',
+    borderRadius: 8,
+    border: '1px solid rgba(239, 68, 68, 0.25)',
+    background: 'rgba(239, 68, 68, 0.12)',
     color: '#f87171',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: 600,
     cursor: 'pointer',
+    outline: 'none',
   },
   confirmBox: {
     padding: '12px',
-    borderRadius: 12,
-    background: 'rgba(239, 68, 68, 0.1)',
-    border: '1px solid rgba(239, 68, 68, 0.3)',
+    borderRadius: 8,
+    background: 'rgba(239, 68, 68, 0.08)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
   },
   confirmText: {
     fontSize: 12,
@@ -1757,31 +2695,34 @@ const S: Record<string, React.CSSProperties> = {
   confirmSleepBtn: {
     flex: 1,
     padding: '8px',
-    borderRadius: 10,
+    borderRadius: 6,
     border: 'none',
     background: '#ef4444',
     color: '#ffffff',
     fontSize: 12,
     fontWeight: 600,
     cursor: 'pointer',
+    outline: 'none',
   },
   confirmCancelBtn: {
     padding: '8px 14px',
-    borderRadius: 10,
-    border: '1px solid rgba(255, 255, 255, 0.15)',
+    borderRadius: 6,
+    border: '1px solid rgba(255, 255, 255, 0.12)',
     background: 'transparent',
-    color: '#e2e8f0',
+    color: '#e4e4e7',
     fontSize: 12,
     cursor: 'pointer',
+    outline: 'none',
   },
   modalLoading: {
-    padding: 30,
+    padding: 24,
     textAlign: 'center',
-    color: '#94a3b8',
-    fontSize: 13,
+    color: '#71717a',
+    fontSize: 12,
+    fontFamily: 'ui-monospace, monospace',
   },
 
-  // 🔍 Diff Modal Styles (Feature 6: Mobile Code Diff Viewer)
+  // Diff Modal Styles
   diffModalOverlay: {
     position: 'fixed',
     inset: 0,
@@ -1795,10 +2736,10 @@ const S: Record<string, React.CSSProperties> = {
   diffModalCard: {
     width: '100%',
     height: '85vh',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    background: '#0d1117',
-    borderTop: '1px solid rgba(255, 255, 255, 0.15)',
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    background: '#101216',
+    borderTop: '1px solid rgba(255, 255, 255, 0.1)',
     boxShadow: '0 -10px 40px rgba(0, 0, 0, 0.8)',
     display: 'flex',
     flexDirection: 'column',
@@ -1809,8 +2750,8 @@ const S: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'space-between',
     padding: '12px 16px',
-    borderBottom: '1px solid #21262d',
-    background: '#161b22',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
+    background: '#14161f',
   },
   diffHeaderLeft: {
     display: 'flex',
@@ -1818,66 +2759,76 @@ const S: Record<string, React.CSSProperties> = {
     gap: 8,
   },
   diffTitle: {
-    fontSize: 15,
+    fontSize: 13.5,
     fontWeight: 600,
-    color: '#f0f6fc',
+    color: '#f4f4f5',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   },
   diffStatsBadge: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: 500,
-    background: '#21262d',
-    padding: '2px 8px',
-    borderRadius: 10,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontVariantNumeric: 'tabular-nums',
+    background: 'rgba(255, 255, 255, 0.06)',
+    padding: '2px 6px',
+    borderRadius: 4,
   },
   diffHeaderRight: {
     display: 'flex',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   diffRefreshBtn: {
     border: 'none',
     background: 'transparent',
-    color: '#8b949e',
-    fontSize: 15,
+    color: '#71717a',
     cursor: 'pointer',
+    padding: 4,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   diffCloseBtn: {
     border: 'none',
     background: 'transparent',
-    color: '#8b949e',
-    fontSize: 16,
+    color: '#71717a',
+    fontSize: 18,
     cursor: 'pointer',
+    lineHeight: 1,
+    padding: 4,
   },
   diffFileTabs: {
     display: 'flex',
-    gap: 6,
-    padding: '8px 12px',
-    background: '#161b22',
-    borderBottom: '1px solid #21262d',
+    gap: 4,
+    padding: '6px 12px',
+    background: '#14161f',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
     overflowX: 'auto',
     WebkitOverflowScrolling: 'touch',
     scrollbarWidth: 'none',
   },
   diffFileTab: {
     flexShrink: 0,
-    padding: '4px 10px',
-    borderRadius: 8,
-    border: '1px solid #30363d',
-    background: '#0d1117',
-    color: '#8b949e',
-    fontSize: 12,
+    padding: '3px 8px',
+    borderRadius: 5,
+    border: '1px solid rgba(255, 255, 255, 0.06)',
+    background: '#101216',
+    color: '#71717a',
+    fontSize: 11,
+    fontFamily: 'ui-monospace, monospace',
     cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
   },
   diffFileTabActive: {
     flexShrink: 0,
-    padding: '4px 10px',
-    borderRadius: 8,
-    border: '1px solid #388bfd',
-    background: 'rgba(56, 139, 253, 0.15)',
-    color: '#58a6ff',
-    fontSize: 12,
+    padding: '3px 8px',
+    borderRadius: 5,
+    border: '1px solid rgba(56, 189, 248, 0.3)',
+    background: 'rgba(56, 189, 248, 0.1)',
+    color: '#38bdf8',
+    fontSize: 11,
+    fontFamily: 'ui-monospace, monospace',
     fontWeight: 600,
     cursor: 'pointer',
     display: 'flex',
@@ -1888,28 +2839,31 @@ const S: Record<string, React.CSSProperties> = {
     overflowY: 'auto',
     overflowX: 'auto',
     WebkitOverflowScrolling: 'touch',
-    background: '#0d1117',
+    background: '#0d0f14',
   },
   diffEmptyState: {
     padding: '40px 20px',
     textAlign: 'center',
-    color: '#8b949e',
-    fontSize: 14,
+    color: '#71717a',
+    fontSize: 13,
+    fontFamily: 'ui-monospace, monospace',
   },
   diffCodeContainer: {
     paddingBottom: 20,
   },
   diffFilePathHeader: {
     padding: '6px 12px',
-    background: '#161b22',
-    color: '#c9d1d9',
-    fontSize: 12,
-    borderBottom: '1px solid #21262d',
+    background: '#14161f',
+    color: '#d4d4d8',
+    fontSize: 11.5,
+    fontFamily: 'ui-monospace, monospace',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.06)',
   },
   diffFileUntracked: {
     padding: '20px',
-    color: '#8b949e',
-    fontSize: 13,
+    color: '#71717a',
+    fontSize: 12,
+    fontFamily: 'ui-monospace, monospace',
   },
   diffPre: {
     margin: 0,
@@ -1920,37 +2874,39 @@ const S: Record<string, React.CSSProperties> = {
   },
   diffLineContext: {
     display: 'flex',
-    color: '#c9d1d9',
+    color: '#a1a1aa',
     padding: '0 4px',
   },
   diffLineAdd: {
     display: 'flex',
-    background: 'rgba(46, 160, 67, 0.18)',
-    color: '#3fb950',
-    borderLeft: '3px solid #2ea043',
-    padding: '0 4px 0 1px',
+    background: 'rgba(34, 197, 94, 0.1)',
+    color: '#4ade80',
+    borderLeft: '2px solid #22c55e',
+    padding: '0 4px 0 2px',
   },
   diffLineDel: {
     display: 'flex',
-    background: 'rgba(248, 81, 73, 0.18)',
-    color: '#f85149',
-    borderLeft: '3px solid #da3633',
-    padding: '0 4px 0 1px',
+    background: 'rgba(239, 68, 68, 0.1)',
+    color: '#f87171',
+    borderLeft: '2px solid #ef4444',
+    padding: '0 4px 0 2px',
   },
   diffLineHeader: {
     display: 'flex',
-    background: 'rgba(56, 139, 253, 0.15)',
-    color: '#79c0ff',
+    background: 'rgba(56, 189, 248, 0.08)',
+    color: '#38bdf8',
     padding: '2px 4px',
     fontSize: 10,
+    fontFamily: 'ui-monospace, monospace',
   },
   diffGutter: {
     width: 32,
-    color: '#484f58',
+    color: '#52525b',
     textAlign: 'right',
     paddingRight: 8,
     flexShrink: 0,
     userSelect: 'none',
+    fontVariantNumeric: 'tabular-nums',
   },
   diffPrefix: {
     width: 12,
@@ -1966,39 +2922,204 @@ const S: Record<string, React.CSSProperties> = {
     display: 'flex',
     gap: 8,
     padding: '10px 14px calc(10px + env(safe-area-inset-bottom, 0px))',
-    background: '#161b22',
-    borderTop: '1px solid #21262d',
+    background: '#14161f',
+    borderTop: '1px solid rgba(255, 255, 255, 0.06)',
   },
   diffApproveBtn: {
     flex: 2,
-    padding: '10px',
-    borderRadius: 12,
+    padding: '9px',
+    borderRadius: 8,
     border: 'none',
-    background: '#238636',
-    color: '#ffffff',
-    fontSize: 13,
+    background: '#22c55e',
+    color: '#052e16',
+    fontSize: 12.5,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     fontWeight: 600,
     cursor: 'pointer',
+    outline: 'none',
   },
   diffRejectBtn: {
     flex: 2,
-    padding: '10px',
-    borderRadius: 12,
+    padding: '9px',
+    borderRadius: 8,
     border: 'none',
-    background: '#da3633',
+    background: '#ef4444',
     color: '#ffffff',
-    fontSize: 13,
+    fontSize: 12.5,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     fontWeight: 600,
     cursor: 'pointer',
+    outline: 'none',
   },
   diffDismissBtn: {
     flex: 1,
-    padding: '10px',
-    borderRadius: 12,
-    border: '1px solid #30363d',
-    background: '#21262d',
-    color: '#c9d1d9',
-    fontSize: 13,
+    padding: '9px',
+    borderRadius: 8,
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    background: 'rgba(255, 255, 255, 0.04)',
+    color: '#a1a1aa',
+    fontSize: 12.5,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     cursor: 'pointer',
+    outline: 'none',
+  },
+
+  // Jump to Bottom Button — Dark Obsidian Keycap
+  jumpToBottomBtn: {
+    position: 'fixed',
+    right: 12,
+    zIndex: BAR_Z + 12,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    background: 'rgba(20, 22, 28, 0.92)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid rgba(255, 255, 255, 0.12)',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.45)',
+    color: '#e4e4e7',
+    fontSize: 16,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    outline: 'none',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    WebkitTapHighlightColor: 'transparent',
+    touchAction: 'manipulation',
+  },
+
+  // Lease Timer Preset Button
+  timerPresetBtn: {
+    padding: '5px 10px',
+    borderRadius: 6,
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    background: 'rgba(255, 255, 255, 0.04)',
+    color: '#d4d4d8',
+    fontSize: 11.5,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    fontWeight: 500,
+    cursor: 'pointer',
+    outline: 'none',
+    WebkitTapHighlightColor: 'transparent',
+  },
+
+  // Biometric & PIN Lock Fullscreen Overlay
+  bioLockOverlay: {
+    position: 'fixed',
+    inset: 0,
+    zIndex: 999999,
+    background: 'rgba(9, 10, 15, 0.97)',
+    backdropFilter: 'blur(24px)',
+    WebkitBackdropFilter: 'blur(24px)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  bioLockCard: {
+    width: '100%',
+    maxWidth: 360,
+    background: '#101216',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    borderRadius: 16,
+    padding: 24,
+    boxShadow: '0 24px 64px rgba(0, 0, 0, 0.8)',
+    textAlign: 'center',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+  },
+  bioLockIcon: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 4,
+  },
+  bioLockTitle: {
+    fontSize: 17,
+    fontWeight: 600,
+    color: '#f4f4f5',
+    marginBottom: 6,
+    letterSpacing: -0.2,
+  },
+  bioLockSubtitle: {
+    fontSize: 12,
+    color: '#71717a',
+    lineHeight: 1.5,
+    marginBottom: 20,
+  },
+  bioAuthBtn: {
+    width: '100%',
+    height: 44,
+    borderRadius: 8,
+    border: 'none',
+    background: '#f4f4f5',
+    color: '#090a0f',
+    fontSize: 13,
+    fontWeight: 600,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    boxShadow: '0 2px 8px rgba(0, 0, 0, 0.3)',
+    outline: 'none',
+    WebkitTapHighlightColor: 'transparent',
+  },
+  bioDividerRow: {
+    display: 'flex',
+    alignItems: 'center',
+    width: '100%',
+    margin: '18px 0',
+  },
+  bioDividerLine: {
+    flex: 1,
+    height: 1,
+    background: 'rgba(255, 255, 255, 0.08)',
+  },
+  bioDividerText: {
+    padding: '0 10px',
+    fontSize: 11,
+    color: '#52525b',
+    fontFamily: 'ui-monospace, monospace',
+  },
+  pinForm: {
+    width: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+  },
+  pinInput: {
+    width: '100%',
+    height: 42,
+    borderRadius: 8,
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    background: 'rgba(255, 255, 255, 0.04)',
+    color: '#ffffff',
+    fontSize: 16,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+    textAlign: 'center',
+    letterSpacing: 4,
+    outline: 'none',
+    boxSizing: 'border-box',
+  },
+  pinSubmitBtn: {
+    width: '100%',
+    height: 40,
+    borderRadius: 8,
+    border: '1px solid rgba(255, 255, 255, 0.12)',
+    background: 'rgba(255, 255, 255, 0.08)',
+    color: '#f4f4f5',
+    fontSize: 13,
+    fontWeight: 500,
+    cursor: 'pointer',
+    outline: 'none',
+  },
+  pinErrorText: {
+    marginTop: 10,
+    color: '#ef4444',
+    fontSize: 11.5,
+    lineHeight: 1.4,
   },
 };
