@@ -89,7 +89,7 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
     } catch {}
   }, [barOpen]);
 
-  /** Dismiss and blur any active element so mobile virtual keyboard NEVER pops up. */
+  /** Dismiss and blur any active element so mobile virtual keyboard drops/remains closed. */
   const dismissKeyboard = () => {
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
@@ -106,17 +106,42 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
     } catch {}
   };
 
+  /** Checks if the virtual keyboard is currently active/visible. */
+  const isKeyboardActive = () => {
+    if (kbInset > 0) return true;
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      return true;
+    }
+    try {
+      const win = getWindow();
+      const iframeActive = win?.document?.activeElement;
+      if (iframeActive && (iframeActive.tagName === 'INPUT' || iframeActive.tagName === 'TEXTAREA')) {
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+
   const lastActionTime = useRef<number>(0);
 
   /**
-   * Action handler that completely blocks focus theft and keyboard popups:
-   * Prevents default touch/mouse action, stops propagation, dismisses active keyboard, then runs action.
-   * Debounces dual touch/pointer/click events within 250ms.
+   * Action handler that preserves the current keyboard state:
+   * - If keyboard is CLOSED: prevents focus theft so keyboard NEVER pops up.
+   * - If keyboard is OPEN: prevents blur so keyboard NEVER drops down.
+   * - Debounces dual touch/pointer/click events within 250ms.
    */
-  const handleNoKeyboard = (fn: () => void) => (e: React.SyntheticEvent) => {
+  const handlePreserveKeyboard = (fn: () => void) => (e: React.SyntheticEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    dismissKeyboard();
+
+    const kbUp = isKeyboardActive();
+    if (!kbUp) {
+      // Bàn phím đang KHÔNG hiện -> đảm bảo không bị kích hoạt mở
+      dismissKeyboard();
+    }
+    // Nếu bàn phím ĐANG HIỆN -> KHÔNG gọi dismissKeyboard() để bàn phím không bị drop!
+
     const now = Date.now();
     if (now - lastActionTime.current < 250) {
       return;
@@ -126,7 +151,6 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   };
 
   const sendArrow = (dir: ArrowDir) => {
-    dismissKeyboard();
     sendDescriptor(getWindow(), { id: dir, label: dir, ariaLabel: `${dir} arrow`, type: 'arrow', dir });
   };
 
@@ -278,9 +302,9 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
           tabIndex={-1}
           aria-label="Di chuyển lên / Lệnh trước (Arrow Up)"
           style={S.navPillBtnTop}
-          onPointerDown={handleNoKeyboard(() => sendArrow('up'))}
-          onTouchStart={handleNoKeyboard(() => sendArrow('up'))}
-          onClick={handleNoKeyboard(() => sendArrow('up'))}
+          onPointerDown={handlePreserveKeyboard(() => sendArrow('up'))}
+          onTouchStart={handlePreserveKeyboard(() => sendArrow('up'))}
+          onClick={handlePreserveKeyboard(() => sendArrow('up'))}
         >
           ▲
         </button>
@@ -290,9 +314,9 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
           tabIndex={-1}
           aria-label="Di chuyển xuống / Lệnh kế tiếp (Arrow Down)"
           style={S.navPillBtnBottom}
-          onPointerDown={handleNoKeyboard(() => sendArrow('down'))}
-          onTouchStart={handleNoKeyboard(() => sendArrow('down'))}
-          onClick={handleNoKeyboard(() => sendArrow('down'))}
+          onPointerDown={handlePreserveKeyboard(() => sendArrow('down'))}
+          onTouchStart={handlePreserveKeyboard(() => sendArrow('down'))}
+          onClick={handlePreserveKeyboard(() => sendArrow('down'))}
         >
           ▼
         </button>
@@ -311,9 +335,9 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
             tabIndex={-1}
             aria-label="Mở thanh chat AI"
             style={S.fabLauncherBtn}
-            onPointerDown={handleNoKeyboard(() => setBarOpen(true))}
-            onTouchStart={handleNoKeyboard(() => setBarOpen(true))}
-            onClick={handleNoKeyboard(() => setBarOpen(true))}
+            onPointerDown={handlePreserveKeyboard(() => setBarOpen(true))}
+            onTouchStart={handlePreserveKeyboard(() => setBarOpen(true))}
+            onClick={handlePreserveKeyboard(() => setBarOpen(true))}
           >
             💬
           </button>
@@ -342,9 +366,9 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
                   tabIndex={-1}
                   aria-label={chip.ariaLabel}
                   style={chipStyle}
-                  onPointerDown={handleNoKeyboard(chip.action)}
-                  onTouchStart={handleNoKeyboard(chip.action)}
-                  onClick={handleNoKeyboard(chip.action)}
+                  onPointerDown={handlePreserveKeyboard(chip.action)}
+                  onTouchStart={handlePreserveKeyboard(chip.action)}
+                  onClick={handlePreserveKeyboard(chip.action)}
                 >
                   {chip.label}
                 </button>
@@ -360,9 +384,9 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
               tabIndex={-1}
               aria-label={isListening ? 'Dừng ghi âm' : 'Nói lệnh qua micro'}
               style={isListening ? S.micListening : S.micBtn}
-              onPointerDown={handleNoKeyboard(toggleSpeechRecognition)}
-              onTouchStart={handleNoKeyboard(toggleSpeechRecognition)}
-              onClick={handleNoKeyboard(toggleSpeechRecognition)}
+              onPointerDown={handlePreserveKeyboard(toggleSpeechRecognition)}
+              onTouchStart={handlePreserveKeyboard(toggleSpeechRecognition)}
+              onClick={handlePreserveKeyboard(toggleSpeechRecognition)}
             >
               {isListening ? '🔴' : '🎙️'}
             </button>
@@ -392,9 +416,18 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
               tabIndex={-1}
               aria-label="Gửi lệnh cho agent"
               style={S.sendBtn}
-              onPointerDown={handleNoKeyboard(onSend)}
-              onTouchStart={handleNoKeyboard(onSend)}
-              onClick={handleNoKeyboard(onSend)}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                onSend();
+              }}
+              onTouchStart={(e) => {
+                e.preventDefault();
+                onSend();
+              }}
+              onClick={(e) => {
+                e.preventDefault();
+                onSend();
+              }}
             >
               ➤
             </button>
@@ -405,9 +438,21 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
               tabIndex={-1}
               aria-label="Thu gọn thanh nhập"
               style={S.hideBtn}
-              onPointerDown={handleNoKeyboard(() => setBarOpen(false))}
-              onTouchStart={handleNoKeyboard(() => setBarOpen(false))}
-              onClick={handleNoKeyboard(() => setBarOpen(false))}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                dismissKeyboard();
+                setBarOpen(false);
+              }}
+              onTouchStart={(e) => {
+                e.preventDefault();
+                dismissKeyboard();
+                setBarOpen(false);
+              }}
+              onClick={(e) => {
+                e.preventDefault();
+                dismissKeyboard();
+                setBarOpen(false);
+              }}
             >
               ⌄
             </button>
