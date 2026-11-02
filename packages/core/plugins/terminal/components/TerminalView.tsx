@@ -72,6 +72,53 @@ const TerminalView = forwardRef<HTMLIFrameElement, Props>(function TerminalView(
     renderReportedRef.current = false;
   }, [sessionId]);
 
+  // Auto-reconnect ttyd iframe on network restore, visibility return, or explicit reconnect event
+  useEffect(() => {
+    let wasOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+
+    const softReload = () => {
+      const iframe = iframeRef.current;
+      if (iframe) {
+        iframe.src = `/t/${sessionId}/`;
+      }
+    };
+
+    const handleOnline = () => {
+      wasOffline = false;
+      softReload();
+    };
+
+    const handleOffline = () => {
+      wasOffline = true;
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && wasOffline) {
+        wasOffline = false;
+        softReload();
+      }
+    };
+
+    const handleCustomReconnect = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (!detail || !detail.sessionId || detail.sessionId === sessionId) {
+        softReload();
+      }
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('omniterm:reconnect-terminal', handleCustomReconnect);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('omniterm:reconnect-terminal', handleCustomReconnect);
+    };
+  }, [sessionId]);
+
   const reportRendered = useCallback(() => {
     if (renderReportedRef.current || mountedAtRef.current === null) return;
     renderReportedRef.current = true;

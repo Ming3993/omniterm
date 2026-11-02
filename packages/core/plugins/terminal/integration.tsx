@@ -695,6 +695,18 @@ export function useTerminalIntegration(
     [],
   );
 
+  const reconnectTerminal = useCallback(
+    (sessionId: string | null) => {
+      if (!sessionId) return;
+      const iframe = iframesBySession.current.get(sessionId);
+      if (iframe) {
+        iframe.src = `/t/${sessionId}/`;
+      }
+      window.dispatchEvent(new CustomEvent('omniterm:reconnect-terminal', { detail: { sessionId } }));
+    },
+    [],
+  );
+
   const renderTerminalLayer = useCallback(
     ({ activeTabId }: { activeTabId: string | null }): ReactNode => {
       // The active workspace's live state is the "flat" snapshot; every other
@@ -858,6 +870,8 @@ export function useTerminalIntegration(
             <MobileInputChrome
               activeSessionId={activeSessionId}
               getWindow={() => resolveTerminalWindow(activeSessionId)}
+              activePath={activePath}
+              onReconnectTerminal={() => reconnectTerminal(activeSessionId)}
             />
           )}
         </div>
@@ -881,6 +895,7 @@ export function useTerminalIntegration(
       setBrowserPanelOpen,
       iframeRefFor,
       resolveTerminalWindow,
+      reconnectTerminal,
     ],
   );
 
