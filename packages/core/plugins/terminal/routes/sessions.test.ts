@@ -239,3 +239,17 @@ test('GET /session-env reports the configured names and never a value', async ()
     }
   });
 });
+
+test('GET /system-health returns health metrics', async () => {
+  await withServer(async (base) => {
+    const res = await fetch(`${base}/system-health`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { ok: boolean; health: any };
+    assert.equal(body.ok, true);
+    assert.ok(body.health);
+    assert.ok(typeof body.health.battery === 'object');
+    assert.ok(typeof body.health.memory === 'object');
+    assert.ok(typeof body.health.cpu === 'object');
+    assert.ok(typeof body.health.uptime === 'number');
+  });
+});

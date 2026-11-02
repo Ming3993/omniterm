@@ -24,6 +24,7 @@ import { trackSessionCreated } from '../../../lib/telemetry.js';
 import { listRepos } from '../../../lib/repos.js';
 import { assertValidEnvName, EnvNameError, getEnvPassthrough } from '../../../lib/sessionEnv.js';
 import { deliverSilenceNotification } from '../lib/silenceMonitor.js';
+import { getSystemHealth, sleepSystem } from '../lib/systemHealth.js';
 
 const execFileAsync = promisify(execFile);
 const DISCOVERY_COMMAND_TIMEOUT_MS = 5000;
@@ -506,6 +507,24 @@ sessionsRouter.post('/notify', async (req, res) => {
       customMessage: message,
     });
     res.json({ ok: true, tunnelActive });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+sessionsRouter.get('/system-health', async (_req, res) => {
+  try {
+    const health = await getSystemHealth();
+    res.json({ ok: true, health });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+sessionsRouter.post('/system-sleep', async (_req, res) => {
+  try {
+    await sleepSystem();
+    res.json({ ok: true, message: 'Mac is sleeping' });
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
