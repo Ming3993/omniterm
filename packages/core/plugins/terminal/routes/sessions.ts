@@ -25,6 +25,7 @@ import { listRepos } from '../../../lib/repos.js';
 import { assertValidEnvName, EnvNameError, getEnvPassthrough } from '../../../lib/sessionEnv.js';
 import { deliverSilenceNotification } from '../lib/silenceMonitor.js';
 import { getSystemHealth, sleepSystem } from '../lib/systemHealth.js';
+import { getGitDiff } from '../lib/gitDiff.js';
 
 const execFileAsync = promisify(execFile);
 const DISCOVERY_COMMAND_TIMEOUT_MS = 5000;
@@ -525,6 +526,16 @@ sessionsRouter.post('/system-sleep', async (_req, res) => {
   try {
     await sleepSystem();
     res.json({ ok: true, message: 'Mac is sleeping' });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+sessionsRouter.get('/git-diff', async (req, res) => {
+  try {
+    const targetDir = typeof req.query.path === 'string' ? req.query.path : undefined;
+    const diff = await getGitDiff(targetDir);
+    res.json({ ok: true, diff });
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }

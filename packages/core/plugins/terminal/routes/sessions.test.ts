@@ -253,3 +253,15 @@ test('GET /system-health returns health metrics', async () => {
     assert.ok(typeof body.health.uptime === 'number');
   });
 });
+
+test('GET /git-diff returns diff results for repository', async () => {
+  await withServer(async (base) => {
+    const res = await fetch(`${base}/git-diff?path=${encodeURIComponent(process.cwd())}`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { ok: boolean; diff: any };
+    assert.equal(body.ok, true);
+    assert.ok(body.diff);
+    assert.equal(body.diff.isGit, true);
+    assert.ok(Array.isArray(body.diff.files));
+  });
+});

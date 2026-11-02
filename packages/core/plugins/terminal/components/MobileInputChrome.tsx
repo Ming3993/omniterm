@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { useKeyboardInset } from '../../../app/useKeyboardInset';
 import {
   TAB,
@@ -12,11 +12,65 @@ import {
   type ArrowDir,
 } from '../lib/terminalInput';
 
+export interface SystemHealthData {
+  battery: {
+    hasBattery: boolean;
+    source: 'AC Power' | 'Battery Power' | 'Unknown';
+    percent: number;
+    chargingState: 'charging' | 'discharging' | 'charged' | 'ac attached' | 'unknown';
+    timeRemaining: string;
+  };
+  memory: {
+    totalGB: number;
+    usedGB: number;
+    freeGB: number;
+    percent: number;
+  };
+  cpu: {
+    cores: number;
+    loadAvg: [number, number, number];
+    percent: number;
+  };
+  uptime: number;
+  uptimeFormatted: string;
+  tunnelActive: boolean;
+}
+
+export interface DiffLine {
+  type: 'add' | 'del' | 'context' | 'header';
+  content: string;
+  oldLineNo?: number;
+  newLineNo?: number;
+}
+
+export interface FileDiffData {
+  file: string;
+  status: 'modified' | 'added' | 'deleted' | 'untracked';
+  additions: number;
+  deletions: number;
+  lines: DiffLine[];
+}
+
+export interface GitDiffData {
+  isGit: boolean;
+  repoRoot: string;
+  files: FileDiffData[];
+  summary: {
+    filesChanged: number;
+    additions: number;
+    deletions: number;
+  };
+}
+
 interface Props {
   /** Accessor for the active terminal iframe's contentWindow (lazy: read at send time). */
   getWindow: () => Window | null;
   /** Id of the active terminal session. */
   activeSessionId: string | null;
+  /** Active workspace path (for git diff queries). */
+  activePath?: string | null;
+  /** Soft-reconnect callback for active terminal iframe. */
+  onReconnectTerminal?: () => void;
 }
 
 interface ActionChip {
@@ -38,16 +92,25 @@ export const keepFocusIf =
  *  - Floating Navigation Pill (▲ / ▼) on the right for history & menu choices.
  *  - AI Prompt Bar with Voice-to-Text (Microphone) + circular Send button.
  *  - Quick Action Chips (Approve y/n, ^C, Tab, Esc, /plan, /goal, Lock).
- *  - STRICT NO-KEYBOARD TRIGGER on navigation & chip actions.
+ *  - Remote Mac Health Bar (Battery %, RAM, CPU, Sleep Mac).
+ *  - Mobile Code Diff Viewer (Color-coded Git Diff with inline Approve/Reject).
+ *  - Network Resilience & Auto-Reconnect (Soft-reconnect with zero prompt loss).
  */
-export default function MobileInputChrome({ getWindow, activeSessionId }: Props) {
+export default function MobileInputChrome({
+  getWindow,
+  activeSessionId,
+  activePath,
+  onReconnectTerminal,
+}: Props) {
   const kbInset = useKeyboardInset();
   const [isListening, setIsListening] = useState(false);
   const [notificationToast, setNotificationToast] = useState<{
     title: string;
     message: string;
     timestamp: number;
+    type?: 'success' | 'info' | 'warning';
   } | null>(null);
+
   const [barOpen, setBarOpen] = useState<boolean>(() => {
     try {
       return localStorage.getItem('omniterm.mobileBar.open') !== 'false';
@@ -55,6 +118,21 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
       return true;
     }
   });
+
+  // Feature 3: Remote Mac Health state
+  const [health, setHealth] = useState<SystemHealthData | null>(null);
+  const [showHealthModal, setShowHealthModal] = useState(false);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [confirmSleep, setConfirmSleep] = useState(false);
+
+  // Feature 5: Network Resilience state
+  const [connectionStatus, setConnectionStatus] = useState<'online' | 'offline' | 'reconnecting'>('online');
+
+  // Feature 6: Mobile Code Diff Viewer state
+  const [showDiffModal, setShowDiffModal] = useState(false);
+  const [diffData, setDiffData] = useState<GitDiffData | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [selectedFileIdx, setSelectedFileIdx] = useState(0);
 
   const composeRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -66,8 +144,173 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   const isInteractingRef = useRef(false);
   const lastActionTime = useRef<number>(0);
 
-  // Lắng nghe sự kiện Agent hoàn thành tác vụ (session-silence)
-  // Thực hiện: Âm thanh Web Audio Chime + Rung điện thoại + Web Notification + Floating Toast
+  // -------------------------------------------------------------
+  // Feature 3: Remote Mac Health Telemetry
+  // -------------------------------------------------------------
+  const fetchHealth = useCallback(async () => {
+    try {
+      setHealthLoading(true);
+      const res = await fetch('/api/system-health', { cache: 'no-store' });
+      if (res.ok) {
+        const body = await res.json();
+        if (body.ok && body.health) {
+          setHealth(body.health);
+        }
+      }
+    } catch {
+      // Offline or network error
+    } finally {
+      setHealthLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchHealth();
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        fetchHealth();
+      }
+    }, 25000);
+    return () => clearInterval(interval);
+  }, [fetchHealth]);
+
+  const handleSleepMac = async () => {
+    try {
+      setConfirmSleep(false);
+      setShowHealthModal(false);
+      setNotificationToast({
+        title: '💤 Cho Mac ngủ',
+        message: 'Đã gửi lệnh đưa Mac vào chế độ ngủ...',
+        timestamp: Date.now(),
+        type: 'info',
+      });
+      await fetch('/api/system-sleep', { method: 'POST' });
+    } catch (err) {
+      setNotificationToast({
+        title: 'Lỗi',
+        message: 'Không thể gửi lệnh ngủ cho Mac: ' + String(err),
+        timestamp: Date.now(),
+        type: 'warning',
+      });
+    }
+  };
+
+  // -------------------------------------------------------------
+  // Feature 5: Network Resilience & Auto-Reconnect
+  // -------------------------------------------------------------
+  const triggerSoftReconnect = useCallback(async () => {
+    setConnectionStatus('reconnecting');
+    setNotificationToast({
+      title: '🔄 Kết nối mạng',
+      message: 'Đang khôi phục kết nối tới Mac & terminal...',
+      timestamp: Date.now(),
+      type: 'info',
+    });
+
+    try {
+      // 1. Soft reconnect active iframe without losing prompt text
+      onReconnectTerminal?.();
+
+      // 2. Ping backend health to verify connection
+      const res = await fetch('/api/session-env', { cache: 'no-store' });
+      if (res.ok) {
+        setConnectionStatus('online');
+        fetchHealth();
+        setNotificationToast({
+          title: '🟢 Đã kết nối',
+          message: 'Kết nối tới agent và Mac đã được khôi phục!',
+          timestamp: Date.now(),
+          type: 'success',
+        });
+        return;
+      }
+    } catch {}
+
+    setConnectionStatus('offline');
+    setNotificationToast({
+      title: '🔴 Mất kết nối',
+      message: 'Chưa thể kết nối lại tới Mac. Vui lòng kiểm tra sóng/tunnel.',
+      timestamp: Date.now(),
+      type: 'warning',
+    });
+  }, [onReconnectTerminal, fetchHealth]);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      triggerSoftReconnect();
+    };
+
+    const handleOffline = () => {
+      setConnectionStatus('offline');
+      setNotificationToast({
+        title: '🔴 Mất kết nối mạng',
+        message: 'Thiết bị của bạn vừa mất kết nối (4G/Wi-Fi ngắt).',
+        timestamp: Date.now(),
+        type: 'warning',
+      });
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [triggerSoftReconnect]);
+
+  // -------------------------------------------------------------
+  // Feature 6: Mobile Code Diff Viewer
+  // -------------------------------------------------------------
+  const fetchDiff = useCallback(async () => {
+    try {
+      setDiffLoading(true);
+      const query = activePath ? `?path=${encodeURIComponent(activePath)}` : '';
+      const res = await fetch(`/api/git-diff${query}`, { cache: 'no-store' });
+      if (res.ok) {
+        const body = await res.json();
+        if (body.ok && body.diff) {
+          setDiffData(body.diff);
+          setSelectedFileIdx(0);
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to fetch diff:', err);
+    } finally {
+      setDiffLoading(false);
+    }
+  }, [activePath]);
+
+  const openDiffViewer = () => {
+    setShowDiffModal(true);
+    fetchDiff();
+  };
+
+  const handleDiffApprove = () => {
+    sendData(getWindow(), 'y\r');
+    setShowDiffModal(false);
+    setNotificationToast({
+      title: '✅ Approve (y)',
+      message: 'Đã gửi xác nhận Apply thay đổi vào terminal!',
+      timestamp: Date.now(),
+      type: 'success',
+    });
+  };
+
+  const handleDiffReject = () => {
+    sendData(getWindow(), 'n\r');
+    setShowDiffModal(false);
+    setNotificationToast({
+      title: '❌ Reject (n)',
+      message: 'Đã gửi từ chối thay đổi vào terminal!',
+      timestamp: Date.now(),
+      type: 'warning',
+    });
+  };
+
+  // -------------------------------------------------------------
+  // Smart Silence Monitor Alert (Tunnel-Aware)
+  // -------------------------------------------------------------
   useEffect(() => {
     const handleSilenceAlert = (e: Event) => {
       const detail = (e as CustomEvent).detail || {};
@@ -104,7 +347,7 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
       } catch {}
 
       // 4. In-App Floating Toast Banner
-      setNotificationToast({ title, message, timestamp: Date.now() });
+      setNotificationToast({ title, message, timestamp: Date.now(), type: 'success' });
     };
 
     window.addEventListener('omniterm:session-silence', handleSilenceAlert);
@@ -121,8 +364,6 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   }, [notificationToast]);
 
   // Native touch & pointer event guard on the navigation pill buttons:
-  // Intercepts events in the capture/target phase with { passive: false }
-  // to prevent mobile browser from dropping virtual keyboard focus.
   useEffect(() => {
     const top = topBtnRef.current;
     const btm = bottomBtnRef.current;
@@ -166,7 +407,7 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
       ro.observe(containerRef.current);
     }
     return () => ro?.disconnect();
-  }, [barOpen, kbInset, isListening]);
+  }, [barOpen, kbInset, isListening, health]);
 
   useEffect(
     () => () => {
@@ -231,7 +472,6 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
     }
 
     if (wasComposing) {
-      // Re-assert focus immediately and in next tick to keep iOS/Android keyboard open
       composeRef.current?.focus({ preventScroll: true });
       setTimeout(() => {
         composeRef.current?.focus({ preventScroll: true });
@@ -265,7 +505,6 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
     if (sendComposed(getWindow(), val, true)) {
       field.value = '';
       field.style.height = '38px';
-      // Dismiss keyboard after sending so user has full view of response
       dismissKeyboard();
     }
   };
@@ -323,8 +562,15 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   };
 
-  // Danh mục Quick Chips mô phỏng phong cách ChatGPT / Gemini
+  // Quick Chips catalog
   const CHIPS: ActionChip[] = [
+    {
+      id: 'diff',
+      label: '🔍 Quick Diff',
+      ariaLabel: 'Xem Git Diff code thay đổi',
+      variant: 'accent',
+      action: openDiffViewer,
+    },
     {
       id: 'yes',
       label: '✅ Approve (y)',
@@ -345,6 +591,18 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
       ariaLabel: 'Interrupt agent',
       variant: 'danger',
       action: () => sendData(getWindow(), ETX),
+    },
+    {
+      id: 'reconnect',
+      label: '🔄 Reconnect',
+      ariaLabel: 'Soft-reconnect terminal',
+      action: triggerSoftReconnect,
+    },
+    {
+      id: 'health',
+      label: '🔋 Mac Health',
+      ariaLabel: 'Xem pin và tình trạng Mac',
+      action: () => setShowHealthModal(true),
     },
     {
       id: 'tab',
@@ -388,18 +646,23 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   ];
 
   const floatingBottom = barOpen
-    ? `calc(${kbInset}px + 120px + env(safe-area-inset-bottom, 0px))`
+    ? `calc(${kbInset}px + 140px + env(safe-area-inset-bottom, 0px))`
     : `calc(${kbInset}px + 20px + env(safe-area-inset-bottom, 0px))`;
+
+  const activeDiffFile = diffData?.files?.[selectedFileIdx];
 
   return (
     <>
-      {/* 🔔 FLOATING TOAST BANNER (Khi agent hoàn thành công việc) */}
+      {/* 🔔 FLOATING TOAST BANNER */}
       {notificationToast && (
-        <div
-          style={S.toastBanner}
-          onClick={() => setNotificationToast(null)}
-        >
-          <div style={S.toastIcon}>🎉</div>
+        <div style={S.toastBanner} onClick={() => setNotificationToast(null)}>
+          <div style={S.toastIcon}>
+            {notificationToast.type === 'success'
+              ? '🎉'
+              : notificationToast.type === 'warning'
+                ? '⚠️'
+                : 'ℹ️'}
+          </div>
           <div style={S.toastBody}>
             <div style={S.toastTitle}>{notificationToast.title}</div>
             <div style={S.toastMessage}>{notificationToast.message}</div>
@@ -418,7 +681,21 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
         </div>
       )}
 
-      {/* 🕹️ FLOATING NAVIGATION PILL (▲ / ▼) — Kiểu ChatGPT Floating Button */}
+      {/* 🔴 NETWORK OFFLINE / RECONNECTING FLOATING BANNER */}
+      {connectionStatus !== 'online' && (
+        <div
+          style={S.networkBanner}
+          onClick={triggerSoftReconnect}
+        >
+          {connectionStatus === 'reconnecting' ? (
+            <span>🔄 Đang khôi phục kết nối...</span>
+          ) : (
+            <span>🔴 Mất mạng (Chạm để kết nối lại 🔄)</span>
+          )}
+        </div>
+      )}
+
+      {/* 🕹️ FLOATING NAVIGATION PILL (▲ / ▼) */}
       <div
         style={{
           ...S.navPillContainer,
@@ -483,6 +760,47 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
             bottom: kbInset,
           }}
         >
+          {/* Top Status Bar: Remote Mac Health Pill */}
+          <div style={S.topStatusBar}>
+            <div
+              style={S.healthPill}
+              onClick={() => setShowHealthModal(true)}
+              title="Chạm để xem chi tiết tình trạng Mac"
+            >
+              {health ? (
+                <>
+                  <span style={S.healthItem}>
+                    {health.battery.hasBattery
+                      ? `${health.battery.chargingState === 'charging' ? '⚡' : '🔋'} ${health.battery.percent}%`
+                      : '🔌 AC'}
+                  </span>
+                  <span style={S.healthDot}>•</span>
+                  <span style={S.healthItem}>💾 RAM {health.memory.percent}%</span>
+                  <span style={S.healthDot}>•</span>
+                  <span style={S.healthItem}>⚡ CPU {health.cpu.percent}%</span>
+                  <span style={S.healthDot}>•</span>
+                  <span style={S.healthItem}>{health.tunnelActive ? '🚇 VM' : '🏠 Mac'}</span>
+                </>
+              ) : (
+                <span style={S.healthItem}>💻 Mac Remote {healthLoading ? '...' : ''}</span>
+              )}
+            </div>
+
+            {/* Quick Sleep Button */}
+            <button
+              type="button"
+              tabIndex={-1}
+              style={S.sleepShortcutBtn}
+              onClick={() => {
+                setConfirmSleep(true);
+                setShowHealthModal(true);
+              }}
+              title="Cho Mac ngủ"
+            >
+              💤 Ngủ
+            </button>
+          </div>
+
           {/* Hàng Quick Chips cuộn ngang */}
           <div style={S.chipsRow}>
             {CHIPS.map((chip) => {
@@ -521,7 +839,7 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
               {isListening ? '🔴' : '🎙️'}
             </button>
 
-            {/* Ô nhập Textarea (chỉ khi chạm vào đây bàn phím mới bật) */}
+            {/* Ô nhập Textarea */}
             <textarea
               ref={composeRef}
               rows={1}
@@ -596,6 +914,286 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
           </div>
         </div>
       )}
+
+      {/* 💻 MODAL: REMOTE MAC HEALTH & POWER MANAGEMENT (Feature 3) */}
+      {showHealthModal && (
+        <div style={S.modalOverlay} onClick={() => setShowHealthModal(false)}>
+          <div style={S.modalCard} onClick={(e) => e.stopPropagation()}>
+            <div style={S.modalHeader}>
+              <div style={S.modalTitle}>💻 Tình trạng Mac từ xa</div>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.modalCloseBtn}
+                onClick={() => setShowHealthModal(false)}
+              >
+                ✕
+              </button>
+            </div>
+
+            {health ? (
+              <div style={S.modalBody}>
+                {/* Battery Block */}
+                <div style={S.metricBlock}>
+                  <div style={S.metricTitle}>
+                    {health.battery.hasBattery
+                      ? `${health.battery.chargingState === 'charging' ? '⚡ Đang cắm sạc' : '🔋 Đang dùng pin'}`
+                      : '🔌 Cắm nguồn trực tiếp'}
+                  </div>
+                  <div style={S.metricValue}>
+                    {health.battery.percent}% {health.battery.timeRemaining ? `• ${health.battery.timeRemaining}` : ''}
+                  </div>
+                  <div style={S.barTrack}>
+                    <div
+                      style={{
+                        ...S.barFill,
+                        width: `${health.battery.percent}%`,
+                        background:
+                          health.battery.percent > 40
+                            ? '#22c55e'
+                            : health.battery.percent > 20
+                              ? '#eab308'
+                              : '#ef4444',
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* Memory Block */}
+                <div style={S.metricBlock}>
+                  <div style={S.metricTitle}>💾 Bộ nhớ RAM</div>
+                  <div style={S.metricValue}>
+                    {health.memory.usedGB} GB / {health.memory.totalGB} GB ({health.memory.percent}%)
+                  </div>
+                  <div style={S.barTrack}>
+                    <div
+                      style={{
+                        ...S.barFill,
+                        width: `${health.memory.percent}%`,
+                        background: health.memory.percent > 85 ? '#f97316' : '#3b82f6',
+                      }}
+                    />
+                  </div>
+                </div>
+
+                {/* CPU & Uptime Block */}
+                <div style={S.metricRow}>
+                  <div style={{ ...S.metricBlock, flex: 1, marginRight: 8 }}>
+                    <div style={S.metricTitle}>⚡ Tải CPU</div>
+                    <div style={S.metricValue}>
+                      {health.cpu.percent}% ({health.cpu.cores} cores)
+                    </div>
+                  </div>
+                  <div style={{ ...S.metricBlock, flex: 1 }}>
+                    <div style={S.metricTitle}>⏱️ Uptime</div>
+                    <div style={S.metricValue}>{health.uptimeFormatted}</div>
+                  </div>
+                </div>
+
+                {/* Tunnel Status */}
+                <div style={S.metricBlock}>
+                  <div style={S.metricTitle}>🚇 Reverse Tunnel (GCP VM)</div>
+                  <div style={S.metricValue}>
+                    {health.tunnelActive ? '🟢 Đang hoạt động (us-west1-b)' : '⚪ Tắt (Local Mac)'}
+                  </div>
+                </div>
+
+                {/* Confirm Sleep Dialog */}
+                {confirmSleep ? (
+                  <div style={S.confirmBox}>
+                    <div style={S.confirmText}>
+                      ⚠️ <b>Xác nhận đưa Mac vào giấc ngủ?</b>
+                      <br />
+                      Khi Mac ngủ, kết nối từ xa sẽ tạm ngắt cho đến khi Mac được đánh thức.
+                    </div>
+                    <div style={S.confirmBtns}>
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        style={S.confirmSleepBtn}
+                        onClick={handleSleepMac}
+                      >
+                        💤 Xác nhận ngủ ngay
+                      </button>
+                      <button
+                        type="button"
+                        tabIndex={-1}
+                        style={S.confirmCancelBtn}
+                        onClick={() => setConfirmSleep(false)}
+                      >
+                        Hủy
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={S.modalActions}>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      style={S.refreshBtn}
+                      onClick={fetchHealth}
+                    >
+                      🔄 Làm mới
+                    </button>
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      style={S.sleepActionBtn}
+                      onClick={() => setConfirmSleep(true)}
+                    >
+                      💤 Cho Mac ngủ
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={S.modalLoading}>Đang kiểm tra kết nối tới Mac...</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 🔍 MODAL: MOBILE CODE DIFF VIEWER (Feature 6) */}
+      {showDiffModal && (
+        <div style={S.diffModalOverlay} onClick={() => setShowDiffModal(false)}>
+          <div style={S.diffModalCard} onClick={(e) => e.stopPropagation()}>
+            {/* Diff Header */}
+            <div style={S.diffHeader}>
+              <div style={S.diffHeaderLeft}>
+                <span style={S.diffTitle}>🔍 Git Diff</span>
+                {diffData && (
+                  <span style={S.diffStatsBadge}>
+                    <span style={{ color: '#4ade80' }}>+{diffData.summary.additions}</span>{' '}
+                    <span style={{ color: '#f87171' }}>-{diffData.summary.deletions}</span>{' '}
+                    <span style={{ color: '#94a3b8' }}>({diffData.files.length} files)</span>
+                  </span>
+                )}
+              </div>
+              <div style={S.diffHeaderRight}>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  style={S.diffRefreshBtn}
+                  onClick={fetchDiff}
+                  title="Tải lại Diff"
+                >
+                  🔄
+                </button>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  style={S.diffCloseBtn}
+                  onClick={() => setShowDiffModal(false)}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* File Selector Tabs */}
+            {diffData && diffData.files.length > 0 && (
+              <div style={S.diffFileTabs}>
+                {diffData.files.map((file, idx) => {
+                  const isSel = idx === selectedFileIdx;
+                  return (
+                    <button
+                      key={file.file}
+                      type="button"
+                      tabIndex={-1}
+                      style={isSel ? S.diffFileTabActive : S.diffFileTab}
+                      onClick={() => setSelectedFileIdx(idx)}
+                    >
+                      <span>{file.file.split('/').pop()}</span>
+                      <span style={{ fontSize: 10, marginLeft: 4, opacity: 0.8 }}>
+                        (+{file.additions} -{file.deletions})
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Diff Viewer Body */}
+            <div style={S.diffBody}>
+              {diffLoading ? (
+                <div style={S.diffEmptyState}>Đang tải code diff...</div>
+              ) : !diffData || !diffData.isGit ? (
+                <div style={S.diffEmptyState}>Thư mục hiện tại không phải Git repository.</div>
+              ) : diffData.files.length === 0 ? (
+                <div style={S.diffEmptyState}>
+                  ✨ Working tree clean! Không có thay đổi nào trong git.
+                </div>
+              ) : activeDiffFile ? (
+                <div style={S.diffCodeContainer}>
+                  <div style={S.diffFilePathHeader}>
+                    📄 <b>{activeDiffFile.file}</b> ({activeDiffFile.status})
+                  </div>
+                  {activeDiffFile.lines.length === 0 ? (
+                    <div style={S.diffFileUntracked}>
+                      Tệp chưa được theo dõi (untracked file).
+                    </div>
+                  ) : (
+                    <pre style={S.diffPre}>
+                      {activeDiffFile.lines.map((line, lIdx) => {
+                        let lineStyle = S.diffLineContext;
+                        let prefix = ' ';
+                        if (line.type === 'add') {
+                          lineStyle = S.diffLineAdd;
+                          prefix = '+';
+                        } else if (line.type === 'del') {
+                          lineStyle = S.diffLineDel;
+                          prefix = '-';
+                        } else if (line.type === 'header') {
+                          lineStyle = S.diffLineHeader;
+                          prefix = '@';
+                        }
+
+                        return (
+                          <div key={lIdx} style={lineStyle}>
+                            <span style={S.diffGutter}>
+                              {line.newLineNo ?? line.oldLineNo ?? ''}
+                            </span>
+                            <span style={S.diffPrefix}>{prefix}</span>
+                            <span style={S.diffCodeContent}>{line.content}</span>
+                          </div>
+                        );
+                      })}
+                    </pre>
+                  )}
+                </div>
+              ) : null}
+            </div>
+
+            {/* Bottom Actions Bar (Approve / Reject directly on mobile) */}
+            <div style={S.diffFooter}>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.diffApproveBtn}
+                onClick={handleDiffApprove}
+              >
+                ✅ Approve (y)
+              </button>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.diffRejectBtn}
+                onClick={handleDiffReject}
+              >
+                ❌ Reject (n)
+              </button>
+              <button
+                type="button"
+                tabIndex={-1}
+                style={S.diffDismissBtn}
+                onClick={() => setShowDiffModal(false)}
+              >
+                Đóng
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -648,79 +1246,82 @@ const S: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     alignItems: 'center',
     width: 48,
-    height: 98,
     borderRadius: 24,
-    background: 'rgba(28, 28, 30, 0.82)',
+    background: 'rgba(28, 30, 38, 0.88)',
     backdropFilter: 'blur(16px)',
     WebkitBackdropFilter: 'blur(16px)',
-    border: '1px solid rgba(255, 255, 255, 0.16)',
-    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.45)',
-    transition: 'bottom 0.2s ease',
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.25)',
     overflow: 'hidden',
-  },
-  navPillBtnTop: {
-    flex: 1,
-    width: '100%',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'transparent',
-    border: 'none',
-    color: '#007aff',
-    fontSize: 17,
-    fontWeight: 'bold',
-    cursor: 'pointer',
+    transition: 'bottom 0.2s cubic-bezier(0.2, 0, 0, 1)',
     userSelect: 'none',
     WebkitUserSelect: 'none',
     touchAction: 'manipulation',
   },
+  navPillBtnTop: {
+    width: '100%',
+    height: 44,
+    border: 'none',
+    background: 'transparent',
+    color: '#e2e8f0',
+    fontSize: 16,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    outline: 'none',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    WebkitTapHighlightColor: 'transparent',
+    touchAction: 'manipulation',
+  },
   navPillDivider: {
-    width: '75%',
+    width: '70%',
     height: 1,
     background: 'rgba(255, 255, 255, 0.12)',
   },
   navPillBtnBottom: {
-    flex: 1,
     width: '100%',
+    height: 44,
+    border: 'none',
+    background: 'transparent',
+    color: '#e2e8f0',
+    fontSize: 16,
+    cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    background: 'transparent',
-    border: 'none',
-    color: '#007aff',
-    fontSize: 17,
-    fontWeight: 'bold',
-    cursor: 'pointer',
+    outline: 'none',
     userSelect: 'none',
     WebkitUserSelect: 'none',
+    WebkitTapHighlightColor: 'transparent',
     touchAction: 'manipulation',
   },
 
-  // 🔘 Floating Action Button khi thu gọn thanh chat
+  // 🔘 FAB Launcher
   fabLauncher: {
     position: 'fixed',
     left: 14,
-    zIndex: BAR_Z,
+    zIndex: BAR_Z + 10,
   },
   fabLauncherBtn: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    background: 'rgba(28, 28, 30, 0.85)',
-    backdropFilter: 'blur(16px)',
-    WebkitBackdropFilter: 'blur(16px)',
-    border: '1px solid rgba(255, 255, 255, 0.18)',
-    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.45)',
-    color: '#fff',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    background: 'rgba(28, 30, 38, 0.92)',
+    backdropFilter: 'blur(12px)',
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.4)',
     fontSize: 20,
+    cursor: 'pointer',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    cursor: 'pointer',
-    touchAction: 'manipulation',
+    color: '#e2e8f0',
+    outline: 'none',
   },
 
-  // 💬 Bottom Chat Input Container (ChatGPT Style)
+  // 💬 ChatGPT / Gemini Style Chat Container
   chatBarContainer: {
     position: 'fixed',
     left: 0,
@@ -728,184 +1329,204 @@ const S: Record<string, React.CSSProperties> = {
     zIndex: BAR_Z,
     display: 'flex',
     flexDirection: 'column',
-    gap: 8,
-    padding: '8px 12px',
-    paddingBottom: 'calc(8px + env(safe-area-inset-bottom, 0px))',
-    background: 'rgba(20, 20, 22, 0.88)',
+    gap: 6,
+    padding: '6px 12px calc(8px + env(safe-area-inset-bottom, 0px))',
+    background: 'linear-gradient(to top, rgba(13, 14, 18, 0.98) 80%, rgba(13, 14, 18, 0.8) 100%)',
     backdropFilter: 'blur(20px)',
     WebkitBackdropFilter: 'blur(20px)',
-    borderTop: '1px solid rgba(255, 255, 255, 0.1)',
-    boxShadow: '0 -4px 20px rgba(0, 0, 0, 0.5)',
+    borderTop: '1px solid rgba(255, 255, 255, 0.08)',
+    boxShadow: '0 -4px 24px rgba(0, 0, 0, 0.5)',
+    transition: 'bottom 0.2s cubic-bezier(0.2, 0, 0, 1)',
   },
 
-  // Hàng Chip hành động cuộn ngang
+  // Top Status Bar in Mobile Chrome
+  topStatusBar: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '0 2px',
+  },
+  healthPill: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    padding: '3px 10px',
+    borderRadius: 12,
+    background: 'rgba(255, 255, 255, 0.06)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    fontSize: 11,
+    color: '#94a3b8',
+    cursor: 'pointer',
+  },
+  healthItem: {
+    fontWeight: 500,
+  },
+  healthDot: {
+    opacity: 0.4,
+  },
+  sleepShortcutBtn: {
+    background: 'rgba(239, 68, 68, 0.12)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
+    color: '#f87171',
+    borderRadius: 12,
+    padding: '3px 8px',
+    fontSize: 11,
+    fontWeight: 500,
+    cursor: 'pointer',
+  },
+
+  // Hàng Quick Chips cuộn ngang
   chipsRow: {
     display: 'flex',
-    gap: 8,
+    gap: 6,
     overflowX: 'auto',
-    whiteSpace: 'nowrap',
-    WebkitOverflowScrolling: 'touch',
+    overflowY: 'hidden',
     paddingBottom: 2,
+    WebkitOverflowScrolling: 'touch',
     scrollbarWidth: 'none',
   },
   chipBase: {
-    flex: '0 0 auto',
-    height: 32,
-    padding: '0 12px',
-    borderRadius: 16,
-    fontSize: 13,
+    flexShrink: 0,
+    padding: '5px 10px',
+    borderRadius: 14,
+    background: 'rgba(255, 255, 255, 0.07)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    color: '#cbd5e1',
+    fontSize: 12,
     fontWeight: 500,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'rgba(255, 255, 255, 0.08)',
-    border: '1px solid rgba(255, 255, 255, 0.12)',
-    color: '#e5e5e7',
     cursor: 'pointer',
     userSelect: 'none',
     WebkitUserSelect: 'none',
-    touchAction: 'manipulation',
+    whiteSpace: 'nowrap',
   },
   chip_success: {
-    background: 'rgba(52, 199, 89, 0.18)',
-    borderColor: '#34c759',
-    color: '#34c759',
+    background: 'rgba(34, 197, 94, 0.15)',
+    border: '1px solid rgba(34, 197, 94, 0.35)',
+    color: '#4ade80',
     fontWeight: 600,
   },
   chip_danger: {
-    background: 'rgba(255, 59, 48, 0.18)',
-    borderColor: '#ff3b30',
-    color: '#ff453a',
-    fontWeight: 600,
+    background: 'rgba(239, 68, 68, 0.15)',
+    border: '1px solid rgba(239, 68, 68, 0.35)',
+    color: '#f87171',
   },
   chip_accent: {
-    background: 'rgba(10, 132, 255, 0.18)',
-    borderColor: '#0a84ff',
-    color: '#0a84ff',
-    fontWeight: 600,
+    background: 'rgba(56, 189, 248, 0.15)',
+    border: '1px solid rgba(56, 189, 248, 0.35)',
+    color: '#38bdf8',
   },
   chip_warning: {
-    background: 'rgba(255, 159, 10, 0.18)',
-    borderColor: '#ff9f0a',
-    color: '#ffd60a',
+    background: 'rgba(234, 179, 8, 0.15)',
+    border: '1px solid rgba(234, 179, 8, 0.35)',
+    color: '#fde047',
   },
 
-  // Khung nhập liệu Pill-shaped
+  // Khung nhập Prompt dạng Pill
   promptPill: {
     display: 'flex',
-    alignItems: 'flex-end',
-    gap: 8,
-    padding: '4px 6px 4px 8px',
+    alignItems: 'center',
+    gap: 6,
+    padding: '4px 6px',
+    background: 'rgba(255, 255, 255, 0.06)',
+    border: '1px solid rgba(255, 255, 255, 0.12)',
     borderRadius: 24,
-    background: 'rgba(38, 38, 42, 0.95)',
-    border: '1px solid rgba(255, 255, 255, 0.15)',
-    boxShadow: 'inset 0 1px 3px rgba(0, 0, 0, 0.2)',
-  },
-  promptInput: {
-    flex: 1,
-    minWidth: 0,
-    height: 38,
-    minHeight: 38,
-    maxHeight: 120,
-    resize: 'none',
-    fontSize: 15,
-    lineHeight: '20px',
-    padding: '9px 4px 7px 4px',
-    background: 'transparent',
-    border: 'none',
-    outline: 'none',
-    color: '#ffffff',
-    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    boxShadow: 'inset 0 1px 2px rgba(0, 0, 0, 0.25)',
   },
   micBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    background: 'transparent',
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     border: 'none',
-    color: '#8e8e93',
-    fontSize: 18,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    flexShrink: 0,
-    marginBottom: 1,
-    touchAction: 'manipulation',
-  },
-  micListening: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    background: 'rgba(255, 59, 48, 0.25)',
-    border: '1px solid #ff3b30',
-    color: '#ff453a',
-    fontSize: 18,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    flexShrink: 0,
-    marginBottom: 1,
-    touchAction: 'manipulation',
-  },
-  sendBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    background: '#007aff',
-    border: 'none',
-    color: '#ffffff',
+    background: 'rgba(255, 255, 255, 0.08)',
+    color: '#e2e8f0',
     fontSize: 16,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     flexShrink: 0,
-    marginBottom: 1,
-    boxShadow: '0 2px 8px rgba(0, 122, 255, 0.4)',
-    touchAction: 'manipulation',
   },
-  hideBtn: {
-    width: 28,
-    height: 36,
-    background: 'transparent',
+  micListening: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     border: 'none',
-    color: '#636366',
-    fontSize: 18,
+    background: 'rgba(239, 68, 68, 0.3)',
+    color: '#ef4444',
+    fontSize: 16,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    flexShrink: 0,
+    animation: 'pulse 1.2s infinite',
+  },
+  promptInput: {
+    flex: 1,
+    minHeight: 22,
+    maxHeight: 120,
+    padding: '6px 8px',
+    border: 'none',
+    background: 'transparent',
+    color: '#f8fafc',
+    fontSize: 14,
+    lineHeight: '20px',
+    resize: 'none',
+    outline: 'none',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  },
+  sendBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    border: 'none',
+    background: '#38bdf8',
+    color: '#0f172a',
+    fontSize: 15,
     fontWeight: 'bold',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
     cursor: 'pointer',
     flexShrink: 0,
-    marginBottom: 1,
-    paddingRight: 4,
-    touchAction: 'manipulation',
+    boxShadow: '0 2px 8px rgba(56, 189, 248, 0.4)',
   },
-
-  // 🔔 Floating Toast Banner thông báo Agent hoàn thành
-  toastBanner: {
-    position: 'fixed',
-    top: 'max(14px, env(safe-area-inset-top, 14px))',
-    left: 14,
-    right: 14,
-    zIndex: BAR_Z + 100,
-    background: 'rgba(28, 28, 30, 0.94)',
-    backdropFilter: 'blur(20px)',
-    WebkitBackdropFilter: 'blur(20px)',
-    border: '1px solid rgba(52, 199, 89, 0.45)',
-    borderRadius: 16,
-    padding: '10px 14px',
+  hideBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    border: 'none',
+    background: 'transparent',
+    color: '#94a3b8',
+    fontSize: 16,
     display: 'flex',
     alignItems: 'center',
-    gap: 12,
-    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.65), 0 0 16px rgba(52, 199, 89, 0.3)',
+    justifyContent: 'center',
     cursor: 'pointer',
+    flexShrink: 0,
+  },
+
+  // 🔔 Toast Notification Banner
+  toastBanner: {
+    position: 'fixed',
+    top: 14,
+    left: 12,
+    right: 12,
+    zIndex: BAR_Z + 100,
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    padding: '10px 14px',
+    borderRadius: 14,
+    background: 'rgba(24, 26, 34, 0.95)',
+    backdropFilter: 'blur(20px)',
+    WebkitBackdropFilter: 'blur(20px)',
+    border: '1px solid rgba(56, 189, 248, 0.3)',
+    boxShadow: '0 10px 30px rgba(0, 0, 0, 0.6)',
+    animation: 'slideDown 0.3s ease-out',
   },
   toastIcon: {
-    fontSize: 22,
-    flexShrink: 0,
+    fontSize: 20,
   },
   toastBody: {
     flex: 1,
@@ -913,25 +1534,413 @@ const S: Record<string, React.CSSProperties> = {
   },
   toastTitle: {
     fontSize: 13,
-    fontWeight: 700,
-    color: '#34c759',
-    marginBottom: 2,
+    fontWeight: 600,
+    color: '#f8fafc',
   },
   toastMessage: {
-    fontSize: 13,
-    color: '#f2f2f7',
-    lineHeight: '17px',
+    fontSize: 12,
+    color: '#cbd5e1',
+    whiteSpace: 'nowrap',
     overflow: 'hidden',
     textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
   },
   toastClose: {
-    background: 'transparent',
     border: 'none',
-    color: '#8e8e93',
+    background: 'transparent',
+    color: '#94a3b8',
     fontSize: 14,
     cursor: 'pointer',
     padding: 4,
+  },
+
+  // 🔴 Network Offline Banner
+  networkBanner: {
+    position: 'fixed',
+    top: 60,
+    left: 20,
+    right: 20,
+    zIndex: BAR_Z + 90,
+    padding: '6px 12px',
+    borderRadius: 20,
+    background: 'rgba(239, 68, 68, 0.92)',
+    backdropFilter: 'blur(10px)',
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: 600,
+    textAlign: 'center',
+    boxShadow: '0 4px 16px rgba(239, 68, 68, 0.4)',
+    cursor: 'pointer',
+  },
+
+  // 💻 Modal Styles (Feature 3: System Health)
+  modalOverlay: {
+    position: 'fixed',
+    inset: 0,
+    zIndex: BAR_Z + 80,
+    background: 'rgba(0, 0, 0, 0.75)',
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 380,
+    borderRadius: 20,
+    background: '#161821',
+    border: '1px solid rgba(255, 255, 255, 0.12)',
+    boxShadow: '0 20px 40px rgba(0, 0, 0, 0.7)',
+    overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
+  },
+  modalHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '14px 16px',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+  },
+  modalTitle: {
+    fontSize: 15,
+    fontWeight: 600,
+    color: '#f8fafc',
+  },
+  modalCloseBtn: {
+    border: 'none',
+    background: 'transparent',
+    color: '#94a3b8',
+    fontSize: 16,
+    cursor: 'pointer',
+  },
+  modalBody: {
+    padding: '16px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 12,
+  },
+  metricBlock: {
+    padding: '10px 12px',
+    borderRadius: 12,
+    background: 'rgba(255, 255, 255, 0.04)',
+    border: '1px solid rgba(255, 255, 255, 0.06)',
+  },
+  metricRow: {
+    display: 'flex',
+  },
+  metricTitle: {
+    fontSize: 12,
+    color: '#94a3b8',
+    marginBottom: 4,
+  },
+  metricValue: {
+    fontSize: 14,
+    fontWeight: 600,
+    color: '#f8fafc',
+  },
+  barTrack: {
+    width: '100%',
+    height: 6,
+    borderRadius: 3,
+    background: 'rgba(255, 255, 255, 0.08)',
+    marginTop: 6,
+    overflow: 'hidden',
+  },
+  barFill: {
+    height: '100%',
+    borderRadius: 3,
+    transition: 'width 0.3s ease',
+  },
+  modalActions: {
+    display: 'flex',
+    gap: 10,
+    marginTop: 6,
+  },
+  refreshBtn: {
+    flex: 1,
+    padding: '10px',
+    borderRadius: 12,
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    background: 'rgba(255, 255, 255, 0.08)',
+    color: '#e2e8f0',
+    fontSize: 13,
+    fontWeight: 500,
+    cursor: 'pointer',
+  },
+  sleepActionBtn: {
+    flex: 1,
+    padding: '10px',
+    borderRadius: 12,
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+    background: 'rgba(239, 68, 68, 0.15)',
+    color: '#f87171',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  confirmBox: {
+    padding: '12px',
+    borderRadius: 12,
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.3)',
+  },
+  confirmText: {
+    fontSize: 12,
+    color: '#fca5a5',
+    lineHeight: '18px',
+    marginBottom: 10,
+  },
+  confirmBtns: {
+    display: 'flex',
+    gap: 8,
+  },
+  confirmSleepBtn: {
+    flex: 1,
+    padding: '8px',
+    borderRadius: 10,
+    border: 'none',
+    background: '#ef4444',
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  confirmCancelBtn: {
+    padding: '8px 14px',
+    borderRadius: 10,
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    background: 'transparent',
+    color: '#e2e8f0',
+    fontSize: 12,
+    cursor: 'pointer',
+  },
+  modalLoading: {
+    padding: 30,
+    textAlign: 'center',
+    color: '#94a3b8',
+    fontSize: 13,
+  },
+
+  // 🔍 Diff Modal Styles (Feature 6: Mobile Code Diff Viewer)
+  diffModalOverlay: {
+    position: 'fixed',
+    inset: 0,
+    zIndex: BAR_Z + 80,
+    background: 'rgba(0, 0, 0, 0.8)',
+    backdropFilter: 'blur(8px)',
+    WebkitBackdropFilter: 'blur(8px)',
+    display: 'flex',
+    alignItems: 'flex-end',
+  },
+  diffModalCard: {
+    width: '100%',
+    height: '85vh',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    background: '#0d1117',
+    borderTop: '1px solid rgba(255, 255, 255, 0.15)',
+    boxShadow: '0 -10px 40px rgba(0, 0, 0, 0.8)',
+    display: 'flex',
+    flexDirection: 'column',
+    overflow: 'hidden',
+  },
+  diffHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '12px 16px',
+    borderBottom: '1px solid #21262d',
+    background: '#161b22',
+  },
+  diffHeaderLeft: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
+  diffTitle: {
+    fontSize: 15,
+    fontWeight: 600,
+    color: '#f0f6fc',
+  },
+  diffStatsBadge: {
+    fontSize: 12,
+    fontWeight: 500,
+    background: '#21262d',
+    padding: '2px 8px',
+    borderRadius: 10,
+  },
+  diffHeaderRight: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+  },
+  diffRefreshBtn: {
+    border: 'none',
+    background: 'transparent',
+    color: '#8b949e',
+    fontSize: 15,
+    cursor: 'pointer',
+  },
+  diffCloseBtn: {
+    border: 'none',
+    background: 'transparent',
+    color: '#8b949e',
+    fontSize: 16,
+    cursor: 'pointer',
+  },
+  diffFileTabs: {
+    display: 'flex',
+    gap: 6,
+    padding: '8px 12px',
+    background: '#161b22',
+    borderBottom: '1px solid #21262d',
+    overflowX: 'auto',
+    WebkitOverflowScrolling: 'touch',
+    scrollbarWidth: 'none',
+  },
+  diffFileTab: {
     flexShrink: 0,
+    padding: '4px 10px',
+    borderRadius: 8,
+    border: '1px solid #30363d',
+    background: '#0d1117',
+    color: '#8b949e',
+    fontSize: 12,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  diffFileTabActive: {
+    flexShrink: 0,
+    padding: '4px 10px',
+    borderRadius: 8,
+    border: '1px solid #388bfd',
+    background: 'rgba(56, 139, 253, 0.15)',
+    color: '#58a6ff',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  diffBody: {
+    flex: 1,
+    overflowY: 'auto',
+    overflowX: 'auto',
+    WebkitOverflowScrolling: 'touch',
+    background: '#0d1117',
+  },
+  diffEmptyState: {
+    padding: '40px 20px',
+    textAlign: 'center',
+    color: '#8b949e',
+    fontSize: 14,
+  },
+  diffCodeContainer: {
+    paddingBottom: 20,
+  },
+  diffFilePathHeader: {
+    padding: '6px 12px',
+    background: '#161b22',
+    color: '#c9d1d9',
+    fontSize: 12,
+    borderBottom: '1px solid #21262d',
+  },
+  diffFileUntracked: {
+    padding: '20px',
+    color: '#8b949e',
+    fontSize: 13,
+  },
+  diffPre: {
+    margin: 0,
+    padding: '4px 0',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+    fontSize: 11,
+    lineHeight: '18px',
+  },
+  diffLineContext: {
+    display: 'flex',
+    color: '#c9d1d9',
+    padding: '0 4px',
+  },
+  diffLineAdd: {
+    display: 'flex',
+    background: 'rgba(46, 160, 67, 0.18)',
+    color: '#3fb950',
+    borderLeft: '3px solid #2ea043',
+    padding: '0 4px 0 1px',
+  },
+  diffLineDel: {
+    display: 'flex',
+    background: 'rgba(248, 81, 73, 0.18)',
+    color: '#f85149',
+    borderLeft: '3px solid #da3633',
+    padding: '0 4px 0 1px',
+  },
+  diffLineHeader: {
+    display: 'flex',
+    background: 'rgba(56, 139, 253, 0.15)',
+    color: '#79c0ff',
+    padding: '2px 4px',
+    fontSize: 10,
+  },
+  diffGutter: {
+    width: 32,
+    color: '#484f58',
+    textAlign: 'right',
+    paddingRight: 8,
+    flexShrink: 0,
+    userSelect: 'none',
+  },
+  diffPrefix: {
+    width: 12,
+    textAlign: 'center',
+    flexShrink: 0,
+    userSelect: 'none',
+  },
+  diffCodeContent: {
+    whiteSpace: 'pre',
+    overflowX: 'visible',
+  },
+  diffFooter: {
+    display: 'flex',
+    gap: 8,
+    padding: '10px 14px calc(10px + env(safe-area-inset-bottom, 0px))',
+    background: '#161b22',
+    borderTop: '1px solid #21262d',
+  },
+  diffApproveBtn: {
+    flex: 2,
+    padding: '10px',
+    borderRadius: 12,
+    border: 'none',
+    background: '#238636',
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  diffRejectBtn: {
+    flex: 2,
+    padding: '10px',
+    borderRadius: 12,
+    border: 'none',
+    background: '#da3633',
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  diffDismissBtn: {
+    flex: 1,
+    padding: '10px',
+    borderRadius: 12,
+    border: '1px solid #30363d',
+    background: '#21262d',
+    color: '#c9d1d9',
+    fontSize: 13,
+    cursor: 'pointer',
   },
 };
