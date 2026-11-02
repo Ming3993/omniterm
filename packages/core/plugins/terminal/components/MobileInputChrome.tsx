@@ -491,6 +491,49 @@ export default function MobileInputChrome({
     }
   };
 
+  // Guard against accidental triggers while swiping / scrolling horizontally across the chips row
+  const isChipDraggingRef = useRef(false);
+  const chipTouchStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const handleChipTouchStart = (e: React.TouchEvent) => {
+    const t = e.touches[0];
+    chipTouchStartRef.current = { x: t.clientX, y: t.clientY };
+    isChipDraggingRef.current = false;
+  };
+
+  const handleChipTouchMove = (e: React.TouchEvent) => {
+    if (!chipTouchStartRef.current) return;
+    const t = e.touches[0];
+    const dx = Math.abs(t.clientX - chipTouchStartRef.current.x);
+    const dy = Math.abs(t.clientY - chipTouchStartRef.current.y);
+    // If finger moves more than 4px horizontally or vertically, it is a scroll/swipe gesture
+    if (dx > 4 || dy > 4) {
+      isChipDraggingRef.current = true;
+    }
+  };
+
+  const handleChipTouchEnd = () => {
+    // Keep isChipDraggingRef true for 250ms to swallow any delayed synthetic click event from the drag
+    if (isChipDraggingRef.current) {
+      setTimeout(() => {
+        isChipDraggingRef.current = false;
+        chipTouchStartRef.current = null;
+      }, 250);
+    } else {
+      chipTouchStartRef.current = null;
+    }
+  };
+
+  const handleChipClick = (action: () => void) => (e: React.SyntheticEvent) => {
+    if (isChipDraggingRef.current) {
+      // Swiping across the bar — ignore tap and prevent sending any command (e.g. Reject 'n')
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    handlePreserveKeyboard(action)(e);
+  };
+
   const sendArrow = (dir: ArrowDir) => {
     sendDescriptor(getWindow(), { id: dir, label: dir, ariaLabel: `${dir} arrow`, type: 'arrow', dir });
   };
@@ -802,7 +845,12 @@ export default function MobileInputChrome({
           </div>
 
           {/* Hàng Quick Chips cuộn ngang */}
-          <div style={S.chipsRow}>
+          <div
+            style={S.chipsRow}
+            onTouchStart={handleChipTouchStart}
+            onTouchMove={handleChipTouchMove}
+            onTouchEnd={handleChipTouchEnd}
+          >
             {CHIPS.map((chip) => {
               const chipStyle = chip.variant
                 ? { ...S.chipBase, ...(S[`chip_${chip.variant}`] || {}) }
@@ -814,9 +862,15 @@ export default function MobileInputChrome({
                   tabIndex={-1}
                   aria-label={chip.ariaLabel}
                   style={chipStyle}
-                  onPointerDown={handlePreserveKeyboard(chip.action)}
-                  onTouchStart={handlePreserveKeyboard(chip.action)}
-                  onClick={handlePreserveKeyboard(chip.action)}
+                  onFocus={(e) => {
+                    // Prevent button from holding DOM focus
+                    e.currentTarget.blur();
+                  }}
+                  onMouseDown={(e) => {
+                    // Prevent focus loss on desktop mouse clicks without interfering with mobile touch scroll
+                    e.preventDefault();
+                  }}
+                  onClick={handleChipClick(chip.action)}
                 >
                   {chip.label}
                 </button>
@@ -1384,6 +1438,7 @@ const S: Record<string, React.CSSProperties> = {
     paddingBottom: 2,
     WebkitOverflowScrolling: 'touch',
     scrollbarWidth: 'none',
+    touchAction: 'pan-x',
   },
   chipBase: {
     flexShrink: 0,
@@ -1398,6 +1453,9 @@ const S: Record<string, React.CSSProperties> = {
     userSelect: 'none',
     WebkitUserSelect: 'none',
     whiteSpace: 'nowrap',
+    touchAction: 'pan-x',
+    WebkitTapHighlightColor: 'transparent',
+    outline: 'none',
   },
   chip_success: {
     background: 'rgba(34, 197, 94, 0.15)',
