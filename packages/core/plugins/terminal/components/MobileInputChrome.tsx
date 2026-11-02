@@ -54,6 +54,44 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   const composeRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
+  const topBtnRef = useRef<HTMLButtonElement>(null);
+  const bottomBtnRef = useRef<HTMLButtonElement>(null);
+
+  const isComposingRef = useRef(false);
+  const isInteractingRef = useRef(false);
+  const lastActionTime = useRef<number>(0);
+
+  // Native touch & pointer event guard on the navigation pill buttons:
+  // Intercepts events in the capture/target phase with { passive: false }
+  // to prevent mobile browser from dropping virtual keyboard focus.
+  useEffect(() => {
+    const top = topBtnRef.current;
+    const btm = bottomBtnRef.current;
+    if (!top || !btm) return;
+
+    const onPointerDownGuard = (e: Event) => {
+      isInteractingRef.current = true;
+      e.preventDefault();
+    };
+
+    top.addEventListener('pointerdown', onPointerDownGuard, { passive: false });
+    top.addEventListener('touchstart', onPointerDownGuard, { passive: false });
+    top.addEventListener('mousedown', onPointerDownGuard);
+
+    btm.addEventListener('pointerdown', onPointerDownGuard, { passive: false });
+    btm.addEventListener('touchstart', onPointerDownGuard, { passive: false });
+    btm.addEventListener('mousedown', onPointerDownGuard);
+
+    return () => {
+      top.removeEventListener('pointerdown', onPointerDownGuard);
+      top.removeEventListener('touchstart', onPointerDownGuard);
+      top.removeEventListener('mousedown', onPointerDownGuard);
+
+      btm.removeEventListener('pointerdown', onPointerDownGuard);
+      btm.removeEventListener('touchstart', onPointerDownGuard);
+      btm.removeEventListener('mousedown', onPointerDownGuard);
+    };
+  }, []);
 
   // Publish bottom clearance to terminal layer
   useLayoutEffect(() => {
@@ -91,6 +129,8 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
 
   /** Dismiss and blur any active element so mobile virtual keyboard drops/remains closed. */
   const dismissKeyboard = () => {
+    isComposingRef.current = false;
+    isInteractingRef.current = false;
     if (document.activeElement instanceof HTMLElement) {
       document.activeElement.blur();
     }
@@ -106,48 +146,50 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
     } catch {}
   };
 
-  /** Checks if the virtual keyboard is currently active/visible. */
-  const isKeyboardActive = () => {
-    if (kbInset > 0) return true;
-    const active = document.activeElement;
-    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-      return true;
-    }
-    try {
-      const win = getWindow();
-      const iframeActive = win?.document?.activeElement;
-      if (iframeActive && (iframeActive.tagName === 'INPUT' || iframeActive.tagName === 'TEXTAREA')) {
-        return true;
-      }
-    } catch {}
-    return false;
-  };
-
-  const lastActionTime = useRef<number>(0);
-
   /**
    * Action handler that preserves the current keyboard state:
-   * - If keyboard is CLOSED: prevents focus theft so keyboard NEVER pops up.
-   * - If keyboard is OPEN: prevents blur so keyboard NEVER drops down.
-   * - Debounces dual touch/pointer/click events within 250ms.
+   * - If keyboard is CLOSED: keeps focus away so keyboard NEVER pops up.
+   * - If keyboard is OPEN: immediately re-focuses active input so keyboard NEVER drops down.
    */
   const handlePreserveKeyboard = (fn: () => void) => (e: React.SyntheticEvent) => {
     e.preventDefault();
     e.stopPropagation();
 
-    const kbUp = isKeyboardActive();
-    if (!kbUp) {
-      // Bàn phím đang KHÔNG hiện -> đảm bảo không bị kích hoạt mở
-      dismissKeyboard();
-    }
-    // Nếu bàn phím ĐANG HIỆN -> KHÔNG gọi dismissKeyboard() để bàn phím không bị drop!
+    isInteractingRef.current = true;
+
+    const wasComposing = isComposingRef.current || document.activeElement === composeRef.current;
+    let wasTerminal = false;
+    try {
+      const win = getWindow();
+      const ta = win?.document?.activeElement;
+      if (ta && ta.tagName === 'TEXTAREA') wasTerminal = true;
+    } catch {}
 
     const now = Date.now();
-    if (now - lastActionTime.current < 250) {
-      return;
+    if (now - lastActionTime.current >= 200) {
+      lastActionTime.current = now;
+      fn();
     }
-    lastActionTime.current = now;
-    fn();
+
+    if (wasComposing) {
+      // Re-assert focus immediately and in next tick to keep iOS/Android keyboard open
+      composeRef.current?.focus({ preventScroll: true });
+      setTimeout(() => {
+        composeRef.current?.focus({ preventScroll: true });
+        isInteractingRef.current = false;
+      }, 50);
+    } else if (wasTerminal) {
+      try {
+        const helper = getWindow()?.document?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null;
+        helper?.focus({ preventScroll: true });
+      } catch {}
+      setTimeout(() => {
+        isInteractingRef.current = false;
+      }, 50);
+    } else {
+      dismissKeyboard();
+      isInteractingRef.current = false;
+    }
   };
 
   const sendArrow = (dir: ArrowDir) => {
@@ -155,6 +197,8 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   };
 
   const onSend = () => {
+    isComposingRef.current = false;
+    isInteractingRef.current = false;
     const field = composeRef.current;
     if (!field) return;
     const val = field.value.trim();
@@ -298,6 +342,7 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
         }}
       >
         <button
+          ref={topBtnRef}
           type="button"
           tabIndex={-1}
           aria-label="Di chuyển lên / Lệnh trước (Arrow Up)"
@@ -310,6 +355,7 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
         </button>
         <div style={S.navPillDivider} />
         <button
+          ref={bottomBtnRef}
           type="button"
           tabIndex={-1}
           aria-label="Di chuyển xuống / Lệnh kế tiếp (Arrow Down)"
@@ -401,6 +447,13 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
               spellCheck={false}
               autoComplete="off"
               style={S.promptInput}
+              onFocus={() => {
+                isComposingRef.current = true;
+              }}
+              onBlur={() => {
+                if (isInteractingRef.current) return;
+                isComposingRef.current = false;
+              }}
               onInput={autoResizeTextarea}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
