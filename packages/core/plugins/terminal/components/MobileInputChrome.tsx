@@ -1,423 +1,668 @@
 'use client';
 
-import { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
-import { flushSync } from 'react-dom';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useKeyboardInset } from '../../../app/useKeyboardInset';
 import {
-  KEY_BAR,
-  ctrlReducer,
+  TAB,
+  ESC,
+  ETX,
   sendComposed,
-  sendControlLetter,
   sendDescriptor,
-  type KeyDescriptor,
+  sendData,
+  type ArrowDir,
 } from '../lib/terminalInput';
 
 interface Props {
   /** Accessor for the active terminal iframe's contentWindow (lazy: read at send time). */
   getWindow: () => Window | null;
-  /**
-   * Id of the active terminal session (null while a terminal tab is active but
-   * its session is still loading). Used to reset the compose buffer / armed Ctrl
-   * when the user genuinely switches to a *different* terminal — without losing
-   * in-progress input across a transient load gap.
-   */
+  /** Id of the active terminal session. */
   activeSessionId: string | null;
 }
 
-const CTRL_LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
+interface ActionChip {
+  id: string;
+  label: string;
+  ariaLabel: string;
+  action: () => void;
+  variant?: 'success' | 'danger' | 'accent' | 'warning' | 'default';
+}
 
-/**
- * A pointer/mouse-down handler that suppresses focus theft (so the soft keyboard
- * stays exactly as it is) only when `active`. The single focus-guard primitive:
- * every bar key uses `keepFocusIf(true)` (always keep focus), while the
- * collapse/expand toggle uses `keepFocusIf(kbInset > 0)` — it must leave the
- * keyboard untouched when one is up but must NOT preventDefault when none is (an
- * unconditional guard can swallow the first tap there).
- *
- * Callers wire it to BOTH onPointerDown and onMouseDown: on a UA with Pointer
- * Events the pointerdown preventDefault already suppresses the synthesized
- * mousedown, so the mousedown handler is just the fallback for any UA that emits
- * mouse events without pointer events.
- */
+/** Suppresses focus theft when active (kept for test compatibility). */
 export const keepFocusIf =
-  (active: boolean) => (e: React.PointerEvent | React.MouseEvent) => {
+  (active: boolean) => (e: { preventDefault: () => void }) => {
     if (active) e.preventDefault();
   };
 
 /**
- * A bar key. Suppresses focus theft (pointer-down preventDefault) so tapping it
- * never blurs whatever holds focus — the terminal's hidden textarea (so the soft
- * keyboard stays open) or the compose field. Every tappable key in the bar goes
- * through this, so a future key can't accidentally omit the focus guard.
- */
-function KeyButton({
-  label,
-  onClick,
-  style,
-  ariaLabel,
-  ariaPressed,
-}: {
-  label: React.ReactNode;
-  onClick: () => void;
-  style?: React.CSSProperties;
-  ariaLabel?: string;
-  ariaPressed?: boolean;
-}) {
-  // Every bar key unconditionally keeps focus (the soft keyboard must stay put).
-  const keepFocus = keepFocusIf(true);
-  return (
-    <button
-      type="button"
-      aria-label={ariaLabel}
-      aria-pressed={ariaPressed}
-      style={style ?? S.key}
-      onPointerDown={keepFocus}
-      onMouseDown={keepFocus}
-      onClick={onClick}
-    >
-      {label}
-    </button>
-  );
-}
-
-/**
- * Mobile-only terminal input chrome (feature 006): an accessory key bar pinned
- * above the soft keyboard for the meta/control keys soft keyboards lack, plus a
- * compose field that lets iPhone dictation arrive as one write.
- *
- * All delivery goes through the same-origin `term` handle (via `getWindow`) using
- * the pure injector in lib/terminalInput. The parent passes the active session
- * id; an effect resets the compose buffer and any armed Ctrl when it changes to a
- * *different* terminal, so input never carries over to another shell (while
- * surviving a transient same-session reload).
+ * Mobile-friendly AI Terminal Chrome (ChatGPT & Gemini App Experience):
+ *  - Floating Navigation Pill (▲ / ▼) on the right for history & menu choices.
+ *  - AI Prompt Bar with Voice-to-Text (Microphone) + circular Send button.
+ *  - Quick Action Chips (Approve y/n, ^C, Tab, Esc, /plan, /goal, Lock).
+ *  - STRICT NO-KEYBOARD TRIGGER on navigation & chip actions.
  */
 export default function MobileInputChrome({ getWindow, activeSessionId }: Props) {
-  const [ctrl, dispatchCtrl] = useReducer(ctrlReducer, 'idle');
-  const [composeOpen, setComposeOpen] = useState(false);
-  // Soft-keyboard height the bar docks above. This same inset feeds the terminal
-  // surface's bottom clearance (published below as a CSS var, consumed by the
-  // ttyd layer in integration.tsx) so the bar sits exactly at the terminal's new
-  // bottom edge — one source of truth, no drift.
   const kbInset = useKeyboardInset();
-  // Collapsed by default so the bar costs almost no screen until summoned.
-  // Persisted so the choice sticks across tab switches / reloads.
-  const [collapsed, setCollapsed] = useState<boolean>(() => {
+  const [isListening, setIsListening] = useState(false);
+  const [barOpen, setBarOpen] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('omniterm.mobileKeys.collapsed') !== 'false';
+      return localStorage.getItem('omniterm.mobileBar.open') !== 'false';
     } catch {
       return true;
     }
   });
+
   const composeRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<any>(null);
 
-  // Publish the terminal's bottom occlusion (keyboard + the bar's own height) as
-  // a CSS var that the ttyd layer in integration.tsx uses as its `bottom`, so the
-  // active prompt clears BOTH the soft keyboard and this bar — not just the
-  // keyboard. (The layer is absolutely positioned, so it must be lifted via its
-  // own `bottom`; an ancestor's paddingBottom can't shrink it.) Collapsed, only
-  // the keyboard counts (the launcher is a small corner toggle, left to float
-  // over the terminal). Expanded, the full-width bar is added via its measured
-  // height. ResizeObserver keeps it correct as the bar grows (compose row, armed
-  // Ctrl letter strip, wrapping). useLayoutEffect + the cleanup that clears the
-  // var keep the terminal's inset in lockstep with the bar across every change.
+  // Publish bottom clearance to terminal layer
   useLayoutEffect(() => {
     const root = document.documentElement;
     const publish = () => {
-      const barH = collapsed ? 0 : (containerRef.current?.offsetHeight ?? 0);
+      const barH = barOpen ? (containerRef.current?.offsetHeight ?? 0) : 0;
       root.style.setProperty('--omniterm-terminal-bottom-inset', `${kbInset + barH}px`);
     };
     publish();
     let ro: ResizeObserver | undefined;
-    if (!collapsed && containerRef.current && typeof ResizeObserver !== 'undefined') {
+    if (barOpen && containerRef.current && typeof ResizeObserver !== 'undefined') {
       ro = new ResizeObserver(publish);
       ro.observe(containerRef.current);
     }
     return () => ro?.disconnect();
-    // composeOpen/ctrl are deps not because the observer needs them (it catches
-    // the resulting height change on its own) but so the synchronous publish()
-    // above runs in the SAME commit those rows mount — without them the inset
-    // would lag the bar's new height by one observer tick (a one-frame occlusion
-    // of the bottom row). collapsed gates the observer; kbInset feeds the value.
-  }, [collapsed, composeOpen, ctrl, kbInset]);
+  }, [barOpen, kbInset, isListening]);
 
-  // Clear the inset when the bar unmounts (e.g. leaving the terminal tab) so a
-  // stale value can't keep padding a terminal that no longer has this bar.
   useEffect(
     () => () => {
       document.documentElement.style.removeProperty('--omniterm-terminal-bottom-inset');
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch {}
+      }
     },
     [],
   );
 
   useEffect(() => {
     try {
-      localStorage.setItem('omniterm.mobileKeys.collapsed', String(collapsed));
-    } catch {
-      // storage unavailable (private mode) — non-fatal
-    }
-  }, [collapsed]);
+      localStorage.setItem('omniterm.mobileBar.open', String(barOpen));
+    } catch {}
+  }, [barOpen]);
 
-  // Reset transient input when the user switches to a DIFFERENT terminal, so a
-  // half-typed line or an armed Ctrl never carries over to another shell. A
-  // transient null (session reloading) is ignored, so input survives a brief
-  // load gap on the same terminal.
-  const lastSessionRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (activeSessionId == null) return;
-    const prev = lastSessionRef.current;
-    if (prev != null && prev !== activeSessionId) {
-      setComposeOpen(false);
-      if (composeRef.current) composeRef.current.value = '';
-      dispatchCtrl('clear');
+  /** Dismiss and blur any active element so mobile virtual keyboard NEVER pops up. */
+  const dismissKeyboard = () => {
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
     }
-    lastSessionRef.current = activeSessionId;
-  }, [activeSessionId]);
-
-  const onCtrlLetter = (letter: string) => {
-    sendControlLetter(getWindow(), letter);
-    dispatchCtrl('consume');
+    try {
+      const win = getWindow();
+      if (win?.document?.activeElement instanceof HTMLElement) {
+        win.document.activeElement.blur();
+      }
+      const helperTa = win?.document?.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null;
+      if (helperTa) {
+        helperTa.blur();
+      }
+    } catch {}
   };
 
-  const onSend = (run: boolean) => {
+  const lastActionTime = useRef<number>(0);
+
+  /**
+   * Action handler that completely blocks focus theft and keyboard popups:
+   * Prevents default touch/mouse action, stops propagation, dismisses active keyboard, then runs action.
+   * Debounces dual touch/pointer/click events within 250ms.
+   */
+  const handleNoKeyboard = (fn: () => void) => (e: React.SyntheticEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dismissKeyboard();
+    const now = Date.now();
+    if (now - lastActionTime.current < 250) {
+      return;
+    }
+    lastActionTime.current = now;
+    fn();
+  };
+
+  const sendArrow = (dir: ArrowDir) => {
+    dismissKeyboard();
+    sendDescriptor(getWindow(), { id: dir, label: dir, ariaLabel: `${dir} arrow`, type: 'arrow', dir });
+  };
+
+  const onSend = () => {
     const field = composeRef.current;
     if (!field) return;
-    if (sendComposed(getWindow(), field.value, run)) {
+    const val = field.value.trim();
+    if (!val) return;
+    if (sendComposed(getWindow(), val, true)) {
       field.value = '';
-      field.focus(); // keep the field ready for the next line
+      field.style.height = '38px';
+      // Dismiss keyboard after sending so user has full view of response
+      dismissKeyboard();
     }
   };
 
-  // Collapsed: a single launcher sitting at the same spot as the expanded bar's
-  // left edge (same left + safe-area offset), so it toggles in place.
-  if (collapsed) {
-    // Toggling the bar must not change the soft-keyboard state. When a keyboard
-    // is up (kbInset>0 ⇒ the terminal textarea holds focus), suppress focus theft
-    // so opening the bar leaves it up. When it's down, allow the normal tap — an
-    // unconditional preventDefault here can swallow the first tap, and there's no
-    // focus worth keeping. One handler, shared by both pointer- and mouse-down.
-    const keepKeyboard = keepFocusIf(kbInset > 0);
-    return (
+  const toggleSpeechRecognition = () => {
+    const SpeechRecognition =
+      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert('Trình duyệt trên thiết bị của bạn không hỗ trợ Web Speech API.');
+      return;
+    }
+
+    if (isListening) {
+      try {
+        recognitionRef.current?.stop();
+      } catch {}
+      setIsListening(false);
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = navigator.language || 'vi-VN';
+
+      recognition.onstart = () => setIsListening(true);
+      recognition.onend = () => setIsListening(false);
+      recognition.onerror = () => setIsListening(false);
+
+      recognition.onresult = (event: any) => {
+        let transcript = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          transcript += event.results[i][0].transcript;
+        }
+        if (composeRef.current && transcript) {
+          const prev = composeRef.current.value;
+          composeRef.current.value = prev ? `${prev} ${transcript}` : transcript;
+          autoResizeTextarea();
+        }
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (err) {
+      console.error('Speech recognition error:', err);
+      setIsListening(false);
+    }
+  };
+
+  const autoResizeTextarea = () => {
+    const el = composeRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+  };
+
+  // Danh mục Quick Chips mô phỏng phong cách ChatGPT / Gemini
+  const CHIPS: ActionChip[] = [
+    {
+      id: 'yes',
+      label: '✅ Approve (y)',
+      ariaLabel: 'Approve and run',
+      variant: 'success',
+      action: () => sendData(getWindow(), 'y\r'),
+    },
+    {
+      id: 'no',
+      label: '❌ Reject (n)',
+      ariaLabel: 'Reject and run',
+      variant: 'danger',
+      action: () => sendData(getWindow(), 'n\r'),
+    },
+    {
+      id: 'ctrl-c',
+      label: '🛑 Stop (^C)',
+      ariaLabel: 'Interrupt agent',
+      variant: 'danger',
+      action: () => sendData(getWindow(), ETX),
+    },
+    {
+      id: 'tab',
+      label: '⇥ Tab',
+      ariaLabel: 'Tab key',
+      action: () => sendDescriptor(getWindow(), { id: 'tab', label: 'Tab', ariaLabel: 'Tab', type: 'bytes', data: TAB }),
+    },
+    {
+      id: 'esc',
+      label: 'Esc',
+      ariaLabel: 'Escape key',
+      action: () => sendDescriptor(getWindow(), { id: 'esc', label: 'Esc', ariaLabel: 'Escape', type: 'bytes', data: ESC }),
+    },
+    {
+      id: 'plan',
+      label: '📋 /plan',
+      ariaLabel: 'Slash plan',
+      variant: 'accent',
+      action: () => sendData(getWindow(), '/plan '),
+    },
+    {
+      id: 'goal',
+      label: '🎯 /goal',
+      ariaLabel: 'Slash goal',
+      variant: 'accent',
+      action: () => sendData(getWindow(), '/goal '),
+    },
+    {
+      id: 'agy',
+      label: '⚡ agy',
+      ariaLabel: 'Start agy',
+      action: () => sendData(getWindow(), 'agy\r'),
+    },
+    {
+      id: 'lock',
+      label: '🔒 Lock Mac',
+      ariaLabel: 'Lock tunnel',
+      variant: 'warning',
+      action: () => sendData(getWindow(), 'remote-tunnel off\r'),
+    },
+  ];
+
+  const floatingBottom = barOpen
+    ? `calc(${kbInset}px + 120px + env(safe-area-inset-bottom, 0px))`
+    : `calc(${kbInset}px + 20px + env(safe-area-inset-bottom, 0px))`;
+
+  return (
+    <>
+      {/* 🕹️ FLOATING NAVIGATION PILL (▲ / ▼) — Kiểu ChatGPT Floating Button */}
       <div
         style={{
-          ...S.launcherWrap,
-          bottom: `calc(${kbInset}px + env(safe-area-inset-bottom, 0px) + 6px)`,
-          // Dim while the active session is still loading — taps no-op until ready.
-          opacity: activeSessionId == null ? 0.4 : 1,
+          ...S.navPillContainer,
+          bottom: floatingBottom,
         }}
       >
         <button
           type="button"
-          aria-label="Show terminal keys (Esc, Ctrl, arrows, dictate)"
-          style={S.collapseBtn}
-          onPointerDown={keepKeyboard}
-          onMouseDown={keepKeyboard}
-          onClick={() => setCollapsed(false)}
+          tabIndex={-1}
+          aria-label="Di chuyển lên / Lệnh trước (Arrow Up)"
+          style={S.navPillBtnTop}
+          onPointerDown={handleNoKeyboard(() => sendArrow('up'))}
+          onTouchStart={handleNoKeyboard(() => sendArrow('up'))}
+          onClick={handleNoKeyboard(() => sendArrow('up'))}
         >
-          »
+          ▲
+        </button>
+        <div style={S.navPillDivider} />
+        <button
+          type="button"
+          tabIndex={-1}
+          aria-label="Di chuyển xuống / Lệnh kế tiếp (Arrow Down)"
+          style={S.navPillBtnBottom}
+          onPointerDown={handleNoKeyboard(() => sendArrow('down'))}
+          onTouchStart={handleNoKeyboard(() => sendArrow('down'))}
+          onClick={handleNoKeyboard(() => sendArrow('down'))}
+        >
+          ▼
         </button>
       </div>
-    );
-  }
 
-  return (
-    <div
-      ref={containerRef}
-      style={{
-        ...S.container,
-        bottom: kbInset,
-        // Dim while the active session is still loading — taps no-op until ready.
-        opacity: activeSessionId == null ? 0.4 : 1,
-      }}
-    >
-      {composeOpen && (
-        <div style={S.composeRow}>
-          <textarea
-            ref={composeRef}
-            // UNCONTROLLED on purpose: the field must own its own value so iOS
-            // dictation revises in place (it re-sends the whole cumulative
-            // transcription expecting replacement). A controlled `value` would
-            // make React own the value and reintroduce the duplication this
-            // field exists to fix. Read/clear via the ref in onSend.
-            defaultValue=""
-            placeholder="Dictate or type a line, then send…"
-            rows={1}
-            // predictive text off so it can't silently alter commands.
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            autoComplete="off"
-            style={S.compose}
-            onKeyDown={(e) => {
-              // isComposing guard: the Enter that commits an IME / dictation
-              // composition must not submit a half-composed line.
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault();
-                onSend(true);
-              }
-            }}
-          />
-          {/* Send buttons keep focus on the textarea so the soft keyboard stays
-              up across consecutive sends (same guard as the keys). */}
-          <KeyButton label="Send" ariaLabel="Send to terminal" onClick={() => onSend(false)} style={S.sendBtn} />
-          <KeyButton label="⏎" ariaLabel="Send and run" onClick={() => onSend(true)} style={S.sendRunBtn} />
+      {/* 🔘 Nút mở lại thanh chat khi đang thu gọn */}
+      {!barOpen && (
+        <div
+          style={{
+            ...S.fabLauncher,
+            bottom: `calc(${kbInset}px + 20px + env(safe-area-inset-bottom, 0px))`,
+          }}
+        >
+          <button
+            type="button"
+            tabIndex={-1}
+            aria-label="Mở thanh chat AI"
+            style={S.fabLauncherBtn}
+            onPointerDown={handleNoKeyboard(() => setBarOpen(true))}
+            onTouchStart={handleNoKeyboard(() => setBarOpen(true))}
+            onClick={handleNoKeyboard(() => setBarOpen(true))}
+          >
+            💬
+          </button>
         </div>
       )}
 
-      <div style={S.barWrap}>
-        {/* Collapse back to the launcher icon. */}
-        <KeyButton
-          label="«"
-          ariaLabel="Hide terminal keys"
-          onClick={() => setCollapsed(true)}
-          style={S.collapseBtn}
-        />
-
-        {/* Compose/dictate toggle — pinned at the front so it's always visible.
-            Intentionally NOT a KeyButton: it must move focus into the textarea
-            (KeyButton's preventDefault would block that), and it mounts the field
-            synchronously then focuses it within this same tap so iOS raises the
-            keyboard on the first tap (a deferred focus won't). */}
-        <button
-          type="button"
-          aria-label="Compose or dictate a line, then send"
-          aria-pressed={composeOpen}
-          style={composeOpen ? S.accent : S.composeToggle}
-          onClick={() => {
-            if (composeOpen) {
-              setComposeOpen(false);
-              return;
-            }
-            flushSync(() => setComposeOpen(true));
-            composeRef.current?.focus();
+      {/* 💬 CHATGPT / GEMINI APP-STYLE BOTTOM INPUT BAR */}
+      {barOpen && (
+        <div
+          ref={containerRef}
+          style={{
+            ...S.chatBarContainer,
+            bottom: kbInset,
           }}
         >
-          💬
-        </button>
+          {/* Hàng Quick Chips cuộn ngang */}
+          <div style={S.chipsRow}>
+            {CHIPS.map((chip) => {
+              const chipStyle = chip.variant
+                ? { ...S.chipBase, ...(S[`chip_${chip.variant}`] || {}) }
+                : S.chipBase;
+              return (
+                <button
+                  key={chip.id}
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={chip.ariaLabel}
+                  style={chipStyle}
+                  onPointerDown={handleNoKeyboard(chip.action)}
+                  onTouchStart={handleNoKeyboard(chip.action)}
+                  onClick={handleNoKeyboard(chip.action)}
+                >
+                  {chip.label}
+                </button>
+              );
+            })}
+          </div>
 
-        <div style={S.barRow}>
-          <KeyButton
-            label="Ctrl"
-            ariaLabel="Ctrl modifier"
-            ariaPressed={ctrl === 'armed'}
-            style={ctrl === 'armed' ? S.accent : S.key}
-            onClick={() => dispatchCtrl('toggle')}
-          />
+          {/* Khung nhập liệu Pill-shaped bo tròn như app ChatGPT/Gemini */}
+          <div style={S.promptPill}>
+            {/* Nút Mic Voice-to-Text */}
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label={isListening ? 'Dừng ghi âm' : 'Nói lệnh qua micro'}
+              style={isListening ? S.micListening : S.micBtn}
+              onPointerDown={handleNoKeyboard(toggleSpeechRecognition)}
+              onTouchStart={handleNoKeyboard(toggleSpeechRecognition)}
+              onClick={handleNoKeyboard(toggleSpeechRecognition)}
+            >
+              {isListening ? '🔴' : '🎙️'}
+            </button>
 
-          {/* While armed, the bar shows an a–z strip; tap a letter to send its
-              control byte. Disarm by tapping Ctrl again. */}
-          {ctrl === 'armed'
-            ? CTRL_LETTERS.map((letter) => (
-                <KeyButton
-                  key={letter}
-                  label={letter}
-                  ariaLabel={`Control ${letter}`}
-                  onClick={() => onCtrlLetter(letter)}
-                />
-              ))
-            : KEY_BAR.map((descriptor: KeyDescriptor) => (
-                <KeyButton
-                  key={descriptor.id}
-                  label={descriptor.label}
-                  ariaLabel={descriptor.ariaLabel}
-                  onClick={() => sendDescriptor(getWindow(), descriptor)}
-                />
-              ))}
+            {/* Ô nhập Textarea (chỉ khi chạm vào đây bàn phím mới bật) */}
+            <textarea
+              ref={composeRef}
+              rows={1}
+              placeholder={isListening ? 'Đang lắng nghe bạn nói...' : 'Nhắn tin cho agy hoặc bấm micro…'}
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              autoComplete="off"
+              style={S.promptInput}
+              onInput={autoResizeTextarea}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  onSend();
+                }
+              }}
+            />
+
+            {/* Nút Gửi tròn xanh (Send button) */}
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label="Gửi lệnh cho agent"
+              style={S.sendBtn}
+              onPointerDown={handleNoKeyboard(onSend)}
+              onTouchStart={handleNoKeyboard(onSend)}
+              onClick={handleNoKeyboard(onSend)}
+            >
+              ➤
+            </button>
+
+            {/* Nút ẩn thanh chat */}
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label="Thu gọn thanh nhập"
+              style={S.hideBtn}
+              onPointerDown={handleNoKeyboard(() => setBarOpen(false))}
+              onTouchStart={handleNoKeyboard(() => setBarOpen(false))}
+              onClick={handleNoKeyboard(() => setBarOpen(false))}
+            >
+              ⌄
+            </button>
+          </div>
         </div>
-      </div>
-    </div>
+      )}
+    </>
   );
 }
 
-// 44px min touch target (Apple HIG 44pt / Material 48dp; comfortably ≥ WCAG 2.5.8).
-const keyBase: React.CSSProperties = {
-  flex: '0 0 auto',
-  minWidth: 44,
-  height: 44,
-  padding: '0 12px',
-  fontSize: 16,
-  lineHeight: '44px',
-  border: '1px solid var(--border, #333)',
-  borderRadius: 6,
-  background: 'var(--bg-secondary, #2a2a2a)',
-  color: 'var(--text, #ddd)',
-  cursor: 'pointer',
-  userSelect: 'none',
-  WebkitUserSelect: 'none',
-  textAlign: 'center',
-};
-
-// Filled accent state shared by the armed Ctrl, the active 💬 toggle, and ⏎.
-const accentKey: React.CSSProperties = {
-  ...keyBase,
-  background: 'var(--accent, #094771)',
-  borderColor: 'var(--accent, #094771)',
-  color: '#fff',
-};
-
-// Above the terminal surface, below the app's modal layer (page.tsx uses
-// backdrop 50 / workspaces overlay 51 / ConfirmDialog 200) — so the bar sits
-// over the terminal but never above a dialog.
-const BAR_Z = 100;
+const BAR_Z = 120;
 
 const S: Record<string, React.CSSProperties> = {
-  container: {
+  // 🕹️ Floating Nav Pill (▲ / ▼) — Glassmorphism
+  navPillContainer: {
+    position: 'fixed',
+    right: 14,
+    zIndex: BAR_Z + 10,
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    width: 48,
+    height: 98,
+    borderRadius: 24,
+    background: 'rgba(28, 28, 30, 0.82)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid rgba(255, 255, 255, 0.16)',
+    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.45)',
+    transition: 'bottom 0.2s ease',
+    overflow: 'hidden',
+  },
+  navPillBtnTop: {
+    flex: 1,
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'transparent',
+    border: 'none',
+    color: '#007aff',
+    fontSize: 17,
+    fontWeight: 'bold',
+    cursor: 'pointer',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    touchAction: 'manipulation',
+  },
+  navPillDivider: {
+    width: '75%',
+    height: 1,
+    background: 'rgba(255, 255, 255, 0.12)',
+  },
+  navPillBtnBottom: {
+    flex: 1,
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'transparent',
+    border: 'none',
+    color: '#007aff',
+    fontSize: 17,
+    fontWeight: 'bold',
+    cursor: 'pointer',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    touchAction: 'manipulation',
+  },
+
+  // 🔘 Floating Action Button khi thu gọn thanh chat
+  fabLauncher: {
+    position: 'fixed',
+    left: 14,
+    zIndex: BAR_Z,
+  },
+  fabLauncherBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    background: 'rgba(28, 28, 30, 0.85)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid rgba(255, 255, 255, 0.18)',
+    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.45)',
+    color: '#fff',
+    fontSize: 20,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+  },
+
+  // 💬 Bottom Chat Input Container (ChatGPT Style)
+  chatBarContainer: {
     position: 'fixed',
     left: 0,
     right: 0,
     zIndex: BAR_Z,
     display: 'flex',
     flexDirection: 'column',
-    gap: 6,
-    padding: 6,
-    paddingBottom: 'calc(6px + env(safe-area-inset-bottom, 0px))',
-    background: 'var(--bg, #1e1e1e)',
-    borderTop: '1px solid var(--border, #333)',
+    gap: 8,
+    padding: '8px 12px',
+    paddingBottom: 'calc(8px + env(safe-area-inset-bottom, 0px))',
+    background: 'rgba(20, 20, 22, 0.88)',
+    backdropFilter: 'blur(20px)',
+    WebkitBackdropFilter: 'blur(20px)',
+    borderTop: '1px solid rgba(255, 255, 255, 0.1)',
+    boxShadow: '0 -4px 20px rgba(0, 0, 0, 0.5)',
   },
-  launcherWrap: {
-    position: 'fixed',
-    left: 6, // matches the expanded bar's inner-content left edge (container padding)
-    zIndex: BAR_Z,
-  },
-  collapseBtn: {
-    ...keyBase,
-    color: 'var(--text-muted, #888)',
-  },
-  barWrap: {
+
+  // Hàng Chip hành động cuộn ngang
+  chipsRow: {
     display: 'flex',
-    gap: 6,
-    alignItems: 'stretch',
-    minWidth: 0,
-  },
-  barRow: {
-    flex: 1,
-    minWidth: 0,
-    display: 'flex',
-    gap: 6,
+    gap: 8,
     overflowX: 'auto',
     whiteSpace: 'nowrap',
+    WebkitOverflowScrolling: 'touch',
+    paddingBottom: 2,
+    scrollbarWidth: 'none',
   },
-  composeToggle: {
-    ...keyBase,
-    borderColor: 'var(--accent, #094771)',
-    color: 'var(--accent, #6ea8e6)',
+  chipBase: {
+    flex: '0 0 auto',
+    height: 32,
+    padding: '0 12px',
+    borderRadius: 16,
+    fontSize: 13,
+    fontWeight: 500,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'rgba(255, 255, 255, 0.08)',
+    border: '1px solid rgba(255, 255, 255, 0.12)',
+    color: '#e5e5e7',
+    cursor: 'pointer',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+    touchAction: 'manipulation',
   },
-  accent: accentKey,
-  key: keyBase,
-  composeRow: { display: 'flex', gap: 6, alignItems: 'stretch' },
-  compose: {
+  chip_success: {
+    background: 'rgba(52, 199, 89, 0.18)',
+    borderColor: '#34c759',
+    color: '#34c759',
+    fontWeight: 600,
+  },
+  chip_danger: {
+    background: 'rgba(255, 59, 48, 0.18)',
+    borderColor: '#ff3b30',
+    color: '#ff453a',
+    fontWeight: 600,
+  },
+  chip_accent: {
+    background: 'rgba(10, 132, 255, 0.18)',
+    borderColor: '#0a84ff',
+    color: '#0a84ff',
+    fontWeight: 600,
+  },
+  chip_warning: {
+    background: 'rgba(255, 159, 10, 0.18)',
+    borderColor: '#ff9f0a',
+    color: '#ffd60a',
+  },
+
+  // Khung nhập liệu Pill-shaped
+  promptPill: {
+    display: 'flex',
+    alignItems: 'flex-end',
+    gap: 8,
+    padding: '4px 6px 4px 8px',
+    borderRadius: 24,
+    background: 'rgba(38, 38, 42, 0.95)',
+    border: '1px solid rgba(255, 255, 255, 0.15)',
+    boxShadow: 'inset 0 1px 3px rgba(0, 0, 0, 0.2)',
+  },
+  promptInput: {
     flex: 1,
     minWidth: 0,
-    minHeight: 44,
+    height: 38,
+    minHeight: 38,
+    maxHeight: 120,
     resize: 'none',
-    fontSize: 16,
-    padding: '8px 10px',
-    border: '1px solid var(--border, #333)',
-    borderRadius: 6,
-    background: 'var(--bg-secondary, #2a2a2a)',
-    color: 'var(--text, #ddd)',
-    fontFamily: 'inherit',
+    fontSize: 15,
+    lineHeight: '20px',
+    padding: '9px 4px 7px 4px',
+    background: 'transparent',
+    border: 'none',
+    outline: 'none',
+    color: '#ffffff',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
   },
-  sendBtn: { ...keyBase, height: 'auto', lineHeight: '1.2', minWidth: 56 },
-  sendRunBtn: { ...accentKey, height: 'auto', lineHeight: '1.2', minWidth: 48 },
+  micBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    background: 'transparent',
+    border: 'none',
+    color: '#8e8e93',
+    fontSize: 18,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    flexShrink: 0,
+    marginBottom: 1,
+    touchAction: 'manipulation',
+  },
+  micListening: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    background: 'rgba(255, 59, 48, 0.25)',
+    border: '1px solid #ff3b30',
+    color: '#ff453a',
+    fontSize: 18,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    flexShrink: 0,
+    marginBottom: 1,
+    touchAction: 'manipulation',
+  },
+  sendBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    background: '#007aff',
+    border: 'none',
+    color: '#ffffff',
+    fontSize: 16,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    flexShrink: 0,
+    marginBottom: 1,
+    boxShadow: '0 2px 8px rgba(0, 122, 255, 0.4)',
+    touchAction: 'manipulation',
+  },
+  hideBtn: {
+    width: 28,
+    height: 36,
+    background: 'transparent',
+    border: 'none',
+    color: '#636366',
+    fontSize: 18,
+    fontWeight: 'bold',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    flexShrink: 0,
+    marginBottom: 1,
+    paddingRight: 4,
+    touchAction: 'manipulation',
+  },
 };
