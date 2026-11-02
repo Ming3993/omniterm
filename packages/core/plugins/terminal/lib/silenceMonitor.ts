@@ -28,6 +28,68 @@ export interface TmuxActivitySnapshot {
 export interface SilenceEvent {
   sessionId: string;
   path: string;
+  customTitle?: string;
+  customMessage?: string;
+}
+
+/** Check if IAP SSH reverse tunnel is currently active */
+export async function isTunnelActive(): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-f', 'gcloud compute start-iap-tunnel.*reverse-tunnel']);
+    if (stdout.trim()) return true;
+  } catch {}
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-u', 'omnitunnel', 'ssh']);
+    if (stdout.trim()) return true;
+  } catch {}
+  try {
+    const { stdout } = await execFileAsync('pgrep', ['-f', 'ssh.*17717.*reverse-tunnel']);
+    if (stdout.trim()) return true;
+  } catch {}
+  return false;
+}
+
+/**
+ * Deliver silence alert based on tunnel state:
+ * - When tunnel is OFF: notify on local Mac (osascript display notification + sound)
+ * - When tunnel is ON: skip Mac native alert to avoid disturbing the Mac, broadcast to phone/browser
+ */
+export async function deliverSilenceNotification(event: SilenceEvent): Promise<boolean> {
+  const tunnelActive = await isTunnelActive();
+  const workspaceName = event.path ? event.path.split('/').filter(Boolean).pop() || 'Dự án' : 'Dự án';
+  const title = event.customTitle || 'OmniTerm / agy';
+  const message = event.customMessage || `Agent đã hoàn thành xong công việc trong [${workspaceName}]!`;
+
+  if (!tunnelActive) {
+    // 🖥️ TUNNEL TẮT -> Người dùng đang ngồi tại máy Mac:
+    // Bắn thông báo desktop native tại máy Mac kèm âm thanh Glass
+    try {
+      const appleScript = `display notification "${message.replace(/"/g, '\\"')}" with title "${title.replace(/"/g, '\\"')}" subtitle "Nhiệm vụ hoàn tất" sound name "Glass"`;
+      await execFileAsync('osascript', ['-e', appleScript]);
+      console.log(`[alert] Mac native desktop notification fired for session=${event.sessionId}`);
+    } catch (err) {
+      console.error('[alert] Failed to send Mac native notification:', err);
+    }
+  } else {
+    // 📱 TUNNEL BẬT -> Người dùng đang ở xa (truy cập qua điện thoại / browser):
+    // Tuyệt đối KHÔNG phát âm thanh hay thông báo trên máy Mac.
+    console.log(`[alert] Tunnel is ACTIVE. Skipped Mac native alert; routing to phone/browser.`);
+  }
+
+  // Luôn broadcast SSE để browser/điện thoại nhận
+  console.log(
+    `[alert] broadcast session-silence session=${event.sessionId} cwd=${event.path} tunnel=${tunnelActive} sse_clients=${getClientCount()}`,
+  );
+  broadcast('session-silence', {
+    path: event.path,
+    sessionId: event.sessionId,
+    tunnelActive,
+    title,
+    message,
+    timestamp: Date.now(),
+  });
+
+  return tunnelActive;
 }
 
 interface SilenceMonitorGlobalState {
@@ -105,10 +167,7 @@ export async function pollSilenceSessions(): Promise<void> {
       snapshots,
       nowSeconds(),
       (event) => {
-        console.log(
-          `[alert] broadcast session-silence session=${event.sessionId} cwd=${event.path} sse_clients=${getClientCount()}`,
-        );
-        broadcast('session-silence', { path: event.path, sessionId: event.sessionId });
+        void deliverSilenceNotification(event);
       },
       { onSessionDeleted: cleanupSilenceSession, trackedSessions },
     );

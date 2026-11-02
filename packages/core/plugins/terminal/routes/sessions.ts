@@ -23,6 +23,7 @@ import { loadSettings } from '../../../lib/settings.js';
 import { trackSessionCreated } from '../../../lib/telemetry.js';
 import { listRepos } from '../../../lib/repos.js';
 import { assertValidEnvName, EnvNameError, getEnvPassthrough } from '../../../lib/sessionEnv.js';
+import { deliverSilenceNotification } from '../lib/silenceMonitor.js';
 
 const execFileAsync = promisify(execFile);
 const DISCOVERY_COMMAND_TIMEOUT_MS = 5000;
@@ -490,5 +491,22 @@ sessionsRouter.get('/discover-sessions', async (_req, res) => {
     res.json(byDir);
   } catch (e: unknown) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+sessionsRouter.post('/notify', async (req, res) => {
+  try {
+    const { title, message, sessionId, path } = (req.body as Record<string, string>) || {};
+    const effectivePath = path || homedir();
+    const effectiveSessionId = sessionId || 'manual-alert';
+    const tunnelActive = await deliverSilenceNotification({
+      sessionId: effectiveSessionId,
+      path: effectivePath,
+      customTitle: title,
+      customMessage: message,
+    });
+    res.json({ ok: true, tunnelActive });
+  } catch (err: unknown) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });

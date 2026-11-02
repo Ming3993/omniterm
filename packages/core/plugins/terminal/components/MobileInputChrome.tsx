@@ -43,6 +43,11 @@ export const keepFocusIf =
 export default function MobileInputChrome({ getWindow, activeSessionId }: Props) {
   const kbInset = useKeyboardInset();
   const [isListening, setIsListening] = useState(false);
+  const [notificationToast, setNotificationToast] = useState<{
+    title: string;
+    message: string;
+    timestamp: number;
+  } | null>(null);
   const [barOpen, setBarOpen] = useState<boolean>(() => {
     try {
       return localStorage.getItem('omniterm.mobileBar.open') !== 'false';
@@ -60,6 +65,60 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
   const isComposingRef = useRef(false);
   const isInteractingRef = useRef(false);
   const lastActionTime = useRef<number>(0);
+
+  // Lắng nghe sự kiện Agent hoàn thành tác vụ (session-silence)
+  // Thực hiện: Âm thanh Web Audio Chime + Rung điện thoại + Web Notification + Floating Toast
+  useEffect(() => {
+    const handleSilenceAlert = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {};
+      const title = detail.title || 'OmniTerm / agy';
+      const message = detail.message || 'Agent đã hoàn thành tác vụ!';
+
+      // 1. Âm thanh chuông báo (Web Audio API Synthesizer)
+      playNotificationChime();
+
+      // 2. Rung điện thoại (Haptic Vibration)
+      if ('vibrate' in navigator && typeof navigator.vibrate === 'function') {
+        try {
+          navigator.vibrate([200, 100, 200]);
+        } catch {}
+      }
+
+      // 3. Web Notification API (nếu được cấp quyền)
+      try {
+        if (typeof Notification !== 'undefined') {
+          if (Notification.permission === 'granted') {
+            new Notification(title, {
+              body: message,
+              icon: '/apple-touch-icon.png',
+              badge: '/apple-touch-icon.png',
+            });
+          } else if (Notification.permission === 'default') {
+            Notification.requestPermission().then((perm) => {
+              if (perm === 'granted') {
+                new Notification(title, { body: message, icon: '/apple-touch-icon.png' });
+              }
+            });
+          }
+        }
+      } catch {}
+
+      // 4. In-App Floating Toast Banner
+      setNotificationToast({ title, message, timestamp: Date.now() });
+    };
+
+    window.addEventListener('omniterm:session-silence', handleSilenceAlert);
+    return () => window.removeEventListener('omniterm:session-silence', handleSilenceAlert);
+  }, []);
+
+  // Tự động tắt Toast Banner sau 6 giây
+  useEffect(() => {
+    if (!notificationToast) return;
+    const timer = setTimeout(() => {
+      setNotificationToast(null);
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [notificationToast]);
 
   // Native touch & pointer event guard on the navigation pill buttons:
   // Intercepts events in the capture/target phase with { passive: false }
@@ -334,6 +393,31 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
 
   return (
     <>
+      {/* 🔔 FLOATING TOAST BANNER (Khi agent hoàn thành công việc) */}
+      {notificationToast && (
+        <div
+          style={S.toastBanner}
+          onClick={() => setNotificationToast(null)}
+        >
+          <div style={S.toastIcon}>🎉</div>
+          <div style={S.toastBody}>
+            <div style={S.toastTitle}>{notificationToast.title}</div>
+            <div style={S.toastMessage}>{notificationToast.message}</div>
+          </div>
+          <button
+            type="button"
+            tabIndex={-1}
+            style={S.toastClose}
+            onClick={(e) => {
+              e.stopPropagation();
+              setNotificationToast(null);
+            }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* 🕹️ FLOATING NAVIGATION PILL (▲ / ▼) — Kiểu ChatGPT Floating Button */}
       <div
         style={{
@@ -514,6 +598,42 @@ export default function MobileInputChrome({ getWindow, activeSessionId }: Props)
       )}
     </>
   );
+}
+
+/** Web Audio API Synthesizer: phát tiếng chuông báo hoàn thành nhiệm vụ nhẹ nhàng */
+function playNotificationChime(): void {
+  try {
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+
+    const osc1 = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(587.33, now); // D5
+    osc1.frequency.exponentialRampToValueAtTime(880, now + 0.15); // A5
+
+    osc2.type = 'triangle';
+    osc2.frequency.setValueAtTime(880, now + 0.15); // A5
+    osc2.frequency.setValueAtTime(1174.66, now + 0.3); // D6
+
+    gain.gain.setValueAtTime(0.3, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.7);
+
+    osc1.connect(gain);
+    osc2.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc1.start(now);
+    osc1.stop(now + 0.3);
+    osc2.start(now + 0.15);
+    osc2.stop(now + 0.7);
+  } catch (err) {
+    console.warn('[chime] Web Audio playback failed:', err);
+  }
 }
 
 const BAR_Z = 120;
@@ -762,5 +882,56 @@ const S: Record<string, React.CSSProperties> = {
     marginBottom: 1,
     paddingRight: 4,
     touchAction: 'manipulation',
+  },
+
+  // 🔔 Floating Toast Banner thông báo Agent hoàn thành
+  toastBanner: {
+    position: 'fixed',
+    top: 'max(14px, env(safe-area-inset-top, 14px))',
+    left: 14,
+    right: 14,
+    zIndex: BAR_Z + 100,
+    background: 'rgba(28, 28, 30, 0.94)',
+    backdropFilter: 'blur(20px)',
+    WebkitBackdropFilter: 'blur(20px)',
+    border: '1px solid rgba(52, 199, 89, 0.45)',
+    borderRadius: 16,
+    padding: '10px 14px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.65), 0 0 16px rgba(52, 199, 89, 0.3)',
+    cursor: 'pointer',
+  },
+  toastIcon: {
+    fontSize: 22,
+    flexShrink: 0,
+  },
+  toastBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  toastTitle: {
+    fontSize: 13,
+    fontWeight: 700,
+    color: '#34c759',
+    marginBottom: 2,
+  },
+  toastMessage: {
+    fontSize: 13,
+    color: '#f2f2f7',
+    lineHeight: '17px',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  toastClose: {
+    background: 'transparent',
+    border: 'none',
+    color: '#8e8e93',
+    fontSize: 14,
+    cursor: 'pointer',
+    padding: 4,
+    flexShrink: 0,
   },
 };

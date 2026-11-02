@@ -530,9 +530,13 @@ export function useTerminalIntegration(
           }
 
           if (data.type === 'session-silence' && data.path && data.sessionId) {
+            // Luôn dispatch custom event để Mobile UI và Web Notification xử lý (chime, rung, banner)
+            try {
+              window.dispatchEvent(new CustomEvent('omniterm:session-silence', { detail: data }));
+            } catch {}
+
             const isActiveWorkspace = curPathMatches(curActivePath, data.path);
             const activeTabHasSession = curIsSessionVisible(data.sessionId, data.path);
-            if (isActiveWorkspace && activeTabHasSession) return;
             if (!isActiveWorkspace) {
               setAlertedPaths((prev) => {
                 const next = new Set(prev);
@@ -540,11 +544,13 @@ export function useTerminalIntegration(
                 return next;
               });
             }
-            setAlertedSessionIds((prev) => {
-              const next = new Set(prev);
-              next.add(data.sessionId);
-              return next;
-            });
+            if (!isActiveWorkspace || !activeTabHasSession) {
+              setAlertedSessionIds((prev) => {
+                const next = new Set(prev);
+                next.add(data.sessionId);
+                return next;
+              });
+            }
           }
         } catch (error) {
           console.error('[alerts] failed to process SSE message', error, e.data);
